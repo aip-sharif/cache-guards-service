@@ -16,7 +16,6 @@ from ..utils.db_utils import (
     get_cache_config,
     update_cache_config,
 )
-from ..utils.external_api import call_external_cache_api
 from ..models.schemas_cache import (
     CacheRegister,
     CacheEdit,
@@ -53,7 +52,8 @@ async def register_cache(
 ):
     name = f"model_{uuid.uuid4().hex[:8]}"
 
-    api_key, project_id = await call_external_cache_api(name=name)
+    project_id = uuid.uuid4().hex
+    api_key = f"sc-proj-{uuid.uuid4().hex}"
 
     cache = create_cache(
         db=db,
