@@ -1,6 +1,7 @@
-from sqlmodel import SQLModel, Field
+from sqlmodel import SQLModel, Field, Column, JSON
 from random import random
 from datetime import datetime, timezone
+from typing import List, Optional
 
 
 def utc_now() -> datetime:
@@ -22,10 +23,37 @@ class Cache(SQLModel, table=True):
     embedd_key: str = Field(default=None, nullable=False)
     llm_model: str = Field(default=None, nullable=False)
     llm_key: str = Field(default=None, nullable=False)
+    cache_key: str = Field(default=None, nullable=True)
+    project_id: str = Field(default=None, nullable=True)
     extaractor: str = Field(default=None, nullable=True)
     extaractor_key: str = Field(default=None, nullable=True)
+    extractor_domain: str = Field(default=None, nullable=True)
 
-    project_id: str = Field(default=None, nullable=True)
-    api_key: str = Field(default=None, nullable=True)
+    created_at: datetime = Field(default_factory=utc_now, nullable=False)
+
+
+class CacheConfig(SQLModel, table=True):
+    id: str = Field(default=None, primary_key=True)
+    cache_id: str = Field(default=None, foreign_key="cache.id", nullable=False, unique=True)
+
+    guard_enabled: bool = Field(default=False, nullable=False)
+    guard_policy: str = Field(default=None, nullable=True)
+
+    cache_mode: List[str] = Field(
+        default_factory=lambda: ["exact", "bm25", "fuzzy", "semantic"],
+        sa_column=Column(JSON),
+    )
+    semantic: dict = Field(
+        default_factory=lambda: {"similarity_threshold": 0.92},
+        sa_column=Column(JSON),
+    )
+    bm25: dict = Field(
+        default_factory=lambda: {"scorer": "BM25", "min_score": 1.0},
+        sa_column=Column(JSON),
+    )
+    fuzzy: dict = Field(
+        default_factory=lambda: {"distance": 2, "min_score": 0.5},
+        sa_column=Column(JSON),
+    )
 
     created_at: datetime = Field(default_factory=utc_now, nullable=False)
