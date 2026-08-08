@@ -3,7 +3,7 @@
 import uuid
 from ..config import DATABASE_URL
 from sqlmodel import SQLModel, create_engine, Session, select
-from ..models.database import User, Cache
+from ..models.database import User, Cache, CacheConfig
 
 engine = create_engine(DATABASE_URL)
 
@@ -59,11 +59,9 @@ def create_cache(
     project_id: str = None,
     extaractor: str = None,
     extaractor_key: str = None,
+    extractor_domain: str = None,
     id: str = None,
 ):
-    # چون هنوز auth واقعی (Casdoor) وصل نیست، جدول user خودکار پر نمی‌شه.
-    # قبل از insert کردن Cache، اگه User متناظر وجود نداشت، خودمون می‌سازیمش
-    # تا foreign key رد نشه.
     if not get_user(db, id_user):
         create_user(db, id=id_user)
 
@@ -79,6 +77,7 @@ def create_cache(
         project_id=project_id,
         extaractor=extaractor,
         extaractor_key=extaractor_key,
+        extractor_domain=extractor_domain,
     )
     db.add(cache)
     db.commit()
@@ -86,23 +85,77 @@ def create_cache(
     return cache
 
 
-# get_cache باید بر اساس id واقعی رکورد (primary key) پیدا کنه -
-# چون update_cache/delete_cache با همین id صداش می‌زنن (نه project_id)
+# get_cache بر اساس id واقعی رکورد (primary key) -
+# چون update_cache/delete_cache با همین id صداش می‌زنن
 def get_cache(db: Session, id: str, id_user: str):
     return db.exec(
         select(Cache).where(Cache.id == id, Cache.id_user == id_user)
     ).first()
 
 
-def get_cache_by_project_id(db: Session, project_id: str):
+# برای زمانی که می‌خوایم بر اساس project_id گیت‌وی (نه id داخلی) پیدا کنیم
+def get_cache_by_project_id(db: Session, project_id: str, id_user: str):
     return db.exec(
-        select(Cache).where(Cache.project_id == project_id)
+        select(Cache).where(Cache.project_id == project_id, Cache.id_user == id_user)
     ).first()
 
 
 def get_cache_by_key(db: Session, cache_key: str):
-    """برای endpoint config که gateway با پروژه‌کی صداش می‌زنه"""
+    """برای endpoint config که gateway با پروژه‌کی (project's own key) صداش می‌زنه"""
     return db.exec(select(Cache).where(Cache.cache_key == cache_key)).first()
+
+
+# ---------------------------
+# CacheConfig CRUD (guard + cache_config)
+# ---------------------------
+
+def create_cache_config(
+    db: Session,
+    cache_id: str,
+    guard_enabled: bool = False,
+    guard_policy: str = None,
+    cache_mode: list = None,
+    semantic: dict = None,
+    bm25: dict = None,
+    fuzzy: dict = None,
+):
+    kwargs = {}
+    if cache_mode is not None:
+        kwargs["cache_mode"] = cache_mode
+    if semantic is not None:
+        kwargs["semantic"] = semantic
+    if bm25 is not None:
+        kwargs["bm25"] = bm25
+    if fuzzy is not None:
+        kwargs["fuzzy"] = fuzzy
+
+    config = CacheConfig(
+        id=str(uuid.uuid4()),
+        cache_id=cache_id,
+        guard_enabled=guard_enabled,
+        guard_policy=guard_policy,
+        **kwargs,
+    )
+    db.add(config)
+    db.commit()
+    db.refresh(config)
+    return config
+
+
+def get_cache_config(db: Session, cache_id: str):
+    return db.exec(select(CacheConfig).where(CacheConfig.cache_id == cache_id)).first()
+
+
+def update_cache_config(db: Session, cache_id: str, data: dict):
+    config = get_cache_config(db, cache_id)
+    if not config:
+        return None
+    for key, value in data.items():
+        if value is not None and hasattr(config, key):
+            setattr(config, key, value)
+    db.commit()
+    db.refresh(config)
+    return config
 
 
 def list_caches(db: Session, id_user: str):
