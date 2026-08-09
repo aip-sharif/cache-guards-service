@@ -85,23 +85,19 @@ def create_cache(
     return cache
 
 
-# get_cache بر اساس id واقعی رکورد (primary key) -
-# چون update_cache/delete_cache با همین id صداش می‌زنن
 def get_cache(db: Session, id: str, id_user: str):
     return db.exec(
         select(Cache).where(Cache.id == id, Cache.id_user == id_user)
     ).first()
 
 
-# برای زمانی که می‌خوایم بر اساس project_id گیت‌وی (نه id داخلی) پیدا کنیم
-def get_cache_by_project_id(db: Session, project_id: str, id_user: str):
+def get_cache_by_project_id(db: Session, project_id: str):
     return db.exec(
-        select(Cache).where(Cache.project_id == project_id, Cache.id_user == id_user)
+        select(Cache).where(Cache.project_id == project_id)
     ).first()
 
 
 def get_cache_by_key(db: Session, cache_key: str):
-    """برای endpoint config که gateway با پروژه‌کی (project's own key) صداش می‌زنه"""
     return db.exec(select(Cache).where(Cache.cache_key == cache_key)).first()
 
 

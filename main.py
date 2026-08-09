@@ -5,8 +5,8 @@ from fastapi.responses import JSONResponse
 from fastapi.exceptions import HTTPException
 from contextlib import asynccontextmanager
 
-from .db_utils import create_db_and_tables
-from .routes_cache import router as cache_router
+from app.utils.db_utils import create_db_and_tables
+from app.routes.routes_cache import router as cache_router
 
 
 @asynccontextmanager
