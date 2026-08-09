@@ -1,8 +1,14 @@
 # schemas_cache.py
 
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Any
 from datetime import datetime
+
+
+class APIResponse(BaseModel):
+    status_code: int
+    message: str
+    data: Optional[Any] = None
 
 
 class GuardConfig(BaseModel):
@@ -58,7 +64,6 @@ class CacheEdit(BaseModel):
 
 
 class GatewayConfigResponse(BaseModel):
-
     model: str
     model_api_key: str
     embed_model: str
@@ -86,8 +91,7 @@ class CacheRead(BaseModel):
     extaractor_key: Optional[str] = None
     extractor_domain: Optional[str] = None
     created_at: datetime
-    guard_enabled: bool = False
-    guard_policy: Optional[str] = None
+    guard: Optional[GuardConfig] = None
     cache_config: Optional[CacheModeConfig] = None
 
     class Config:

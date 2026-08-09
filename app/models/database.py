@@ -28,8 +28,9 @@ class Cache(SQLModel, table=True):
     extaractor: str = Field(default=None, nullable=True)
     extaractor_key: str = Field(default=None, nullable=True)
     extractor_domain: str = Field(default=None, nullable=True)
-
+    
     created_at: datetime = Field(default_factory=utc_now, nullable=False)
+    #gurd: bool = Field(default=False)
 
 
 class CacheConfig(SQLModel, table=True):
