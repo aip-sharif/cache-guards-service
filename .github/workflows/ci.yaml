@@ -41,3 +41,15 @@ jobs:
 
       - name: Build Docker image
         run: docker build -t caching-service:ci .
+
+  # اگه بعداً تست‌های واقعی (pytest) اضافه کردید، این job رو فعال کنید:
+  # test:
+  #   runs-on: ubuntu-latest
+  #   needs: lint-and-build
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: actions/setup-python@v5
+  #       with:
+  #         python-version: "3.10"
+  #     - run: pip install -r requirements.txt pytest
+  #     - run: pytest
