@@ -28,9 +28,8 @@ class Cache(SQLModel, table=True):
     extaractor: str = Field(default=None, nullable=True)
     extaractor_key: str = Field(default=None, nullable=True)
     extractor_domain: str = Field(default=None, nullable=True)
-    
+
     created_at: datetime = Field(default_factory=utc_now, nullable=False)
-    #gurd: bool = Field(default=False)
 
 
 class CacheConfig(SQLModel, table=True):
@@ -39,8 +38,9 @@ class CacheConfig(SQLModel, table=True):
 
     guard_enabled: bool = Field(default=False, nullable=False)
     guard_policy: str = Field(default=None, nullable=True)
+    guard_config: dict = Field(default_factory=dict, sa_column=Column(JSON))
 
-    cache_mode: List[str] = Field(
+    cache_mode: object = Field(
         default_factory=lambda: ["exact", "bm25", "fuzzy", "semantic"],
         sa_column=Column(JSON),
     )

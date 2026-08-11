@@ -91,13 +91,14 @@ def get_cache(db: Session, id: str, id_user: str):
     ).first()
 
 
-def get_cache_by_project_id(db: Session, project_id: str):
+def get_cache_by_project_id(db: Session, project_id: str, id_user: str):
     return db.exec(
-        select(Cache).where(Cache.project_id == project_id)
+        select(Cache).where(Cache.project_id == project_id, Cache.id_user == id_user)
     ).first()
 
 
 def get_cache_by_key(db: Session, cache_key: str):
+    """برای endpoint config که gateway با پروژه‌کی (project's own key) صداش می‌زنه"""
     return db.exec(select(Cache).where(Cache.cache_key == cache_key)).first()
 
 
@@ -110,7 +111,8 @@ def create_cache_config(
     cache_id: str,
     guard_enabled: bool = False,
     guard_policy: str = None,
-    cache_mode: list = None,
+    guard_config: dict = None,
+    cache_mode=None,
     semantic: dict = None,
     bm25: dict = None,
     fuzzy: dict = None,
@@ -124,6 +126,8 @@ def create_cache_config(
         kwargs["bm25"] = bm25
     if fuzzy is not None:
         kwargs["fuzzy"] = fuzzy
+    if guard_config is not None:
+        kwargs["guard_config"] = guard_config
 
     config = CacheConfig(
         id=str(uuid.uuid4()),
