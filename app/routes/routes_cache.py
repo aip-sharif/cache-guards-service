@@ -16,6 +16,7 @@ from ..utils.db_utils import (
     get_cache_config,
     update_cache_config,
 )
+from ..utils.guard_utils import resolve_guard
 from ..models.schemas_cache import (
     CacheRegister,
     CacheEdit,
@@ -24,11 +25,20 @@ from ..models.schemas_cache import (
     GatewayConfigResponse,
     CacheModeConfig,
 )
-from ..auth import get_current_user_id, verify_gateway_admin_key
+from ..auth import get_current_user_id
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 router = APIRouter(prefix="/cache", tags=["cache"])
 project_key_scheme = HTTPBearer()
+
+_GUARD_ENABLED_POLICY_KEYS = {"enabled", "policy"}
+
+
+def _guard_extra_fields(guard) -> dict:
+    if guard is None:
+        return {}
+    data = guard.model_dump(exclude_unset=False)
+    return {k: v for k, v in data.items() if k not in _GUARD_ENABLED_POLICY_KEYS}
 
 
 def _build_cache_read(cache, config) -> CacheRead:
@@ -37,7 +47,11 @@ def _build_cache_read(cache, config) -> CacheRead:
     cache_config = None
     if config:
         if config.guard_enabled:
-            guard = {"enabled": config.guard_enabled, "policy": config.guard_policy}
+            guard = {
+                "enabled": config.guard_enabled,
+                "policy": config.guard_policy,
+                **(config.guard_config or {}),
+            }
         cache_config = {
             "cache_mode": config.cache_mode,
             "semantic": config.semantic,
@@ -49,13 +63,18 @@ def _build_cache_read(cache, config) -> CacheRead:
     return CacheRead(**data)
 
 
+# ---------------------------------------------------------
+# 1) Register 
+# ---------------------------------------------------------
 @router.post("/register", response_model=APIResponse)
 async def register_cache(
     data: CacheRegister,
     db: Session = Depends(get_session),
-    id_user: str = "x", #Depends(get_current_user_id),
+    id_user: str = Depends(get_current_user_id),
 ):
     try:
+        resolved_guard = resolve_guard(data.guard, id_user)
+
         name = f"model_{uuid.uuid4().hex[:8]}"
 
         project_id = uuid.uuid4().hex
@@ -80,8 +99,9 @@ async def register_cache(
         config = create_cache_config(
             db=db,
             cache_id=cache.id,
-            guard_enabled=data.guard.enabled,
-            guard_policy=data.guard.policy,
+            guard_enabled=bool(resolved_guard.enabled) if resolved_guard else False,
+            guard_policy=resolved_guard.policy if resolved_guard else None,
+            guard_config=_guard_extra_fields(resolved_guard),
             cache_mode=cc.cache_mode if cc else None,
             semantic=cc.semantic.model_dump() if cc else None,
             bm25=cc.bm25.model_dump() if cc else None,
@@ -91,8 +111,7 @@ async def register_cache(
         return APIResponse(
             status_code=201,
             message="Cache registered successfully",
-            data= project_id,
-            #data=_build_cache_read(cache, config),
+            data=_build_cache_read(cache, config),
         )
     except HTTPException:
         raise
@@ -105,7 +124,7 @@ def edit_cache(
     cache_id: str,
     data: CacheEdit,
     db: Session = Depends(get_session),
-    id_user: str ="x",# Depends(get_current_user_id),
+    id_user: str = Depends(get_current_user_id),
 ):
     try:
         update_data = data.model_dump(exclude_unset=True, exclude={"guard", "cache_config"})
@@ -117,9 +136,12 @@ def edit_cache(
         config = get_cache_config(db=db, cache_id=cache_id)
 
         config_update = {}
-        if data.guard is not None:
-            config_update["guard_enabled"] = data.guard.enabled
-            config_update["guard_policy"] = data.guard.policy
+        if "guard" in data.model_fields_set:
+            resolved_guard = resolve_guard(data.guard, id_user)
+            config_update["guard_enabled"] = bool(resolved_guard.enabled) if resolved_guard else False
+            config_update["guard_policy"] = resolved_guard.policy if resolved_guard else None
+            config_update["guard_config"] = _guard_extra_fields(resolved_guard)
+
         if data.cache_config is not None:
             config_update["cache_mode"] = data.cache_config.cache_mode
             config_update["semantic"] = data.cache_config.semantic.model_dump()
@@ -139,14 +161,17 @@ def edit_cache(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update cache: {e}")
 
+
+# ---------------------------------------------------------
+# 3) Read -> خواندن یک کش (بر اساس project_id)
+# ---------------------------------------------------------
 @router.get("/{project_id}", response_model=APIResponse)
 def read_cache(
     project_id: str,
     db: Session = Depends(get_session),
-    id_user: str = "x",#Depends(get_current_user_id),
-    id: str= Depends(verify_gateway_admin_key)
+    id_user: str = Depends(get_current_user_id),
 ):
-    cache = get_cache_by_project_id(db=db, project_id=project_id)
+    cache = get_cache_by_project_id(db=db, project_id=project_id, id_user=id_user)
     if not cache:
         raise HTTPException(status_code=404, detail="Cache not found")
     config = get_cache_config(db=db, cache_id=cache.id)
@@ -157,10 +182,15 @@ def read_cache(
     )
 
 
-@router.get("/", response_model=APIResponse)
+# ---------------------------------------------------------
+# 3ب) Read -> لیست همه‌ی کش‌های کاربر (خودِ ما، نه gateway)
+#     مسیر عمداً "/mine" هست تا با GET /cache که مخصوص
+#     gateway هست تصادم نداشته باشه (طبق APP_INTEGRATION.md §2)
+# ---------------------------------------------------------
+@router.get("/mine", response_model=APIResponse)
 def read_all_caches(
     db: Session = Depends(get_session),
-    id_user: str = "x"#Depends(get_current_user_id),
+    id_user: str = Depends(get_current_user_id),
 ):
     caches = list_caches(db=db, id_user=id_user)
     results = []
@@ -174,7 +204,12 @@ def read_all_caches(
     )
 
 
-@router.get("/gw/config", response_model=GatewayConfigResponse)
+# ---------------------------------------------------------
+# 4) Config endpoint -> این رو خودِ gateway صدا می‌زنه:
+#    GET /cache   (دقیقاً همین مسیر، طبق APP_INTEGRATION.md §2)
+#    Authorization: Bearer <client's own key> (نه ادمین‌کی)
+# ---------------------------------------------------------
+@router.get("", response_model=GatewayConfigResponse)
 def gateway_config(
     db: Session = Depends(get_session),
     credentials: HTTPAuthorizationCredentials = Depends(project_key_scheme),
@@ -184,6 +219,14 @@ def gateway_config(
         raise HTTPException(status_code=403, detail="invalid project key")
 
     config = get_cache_config(db=db, cache_id=cache.id)
+
+    guard_response = None
+    if config and config.guard_enabled:
+        guard_response = {
+            "enabled": config.guard_enabled,
+            "policy": config.guard_policy,
+            **(config.guard_config or {}),
+        }
 
     return GatewayConfigResponse(
         model=cache.llm_model,
@@ -200,9 +243,5 @@ def gateway_config(
             bm25=config.bm25 if config else {"scorer": "BM25", "min_score": 1.0},
             fuzzy=config.fuzzy if config else {"distance": 2, "min_score": 0.5},
         ),
-        guard=(
-            {"enabled": config.guard_enabled, "policy": config.guard_policy}
-            if config and config.guard_enabled
-            else None
-        ),
+        guard=guard_response,
     )
