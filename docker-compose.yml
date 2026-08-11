@@ -18,10 +18,10 @@ services:
       retries: 10
 
   api:
-    build: .
+    build: ./cache_api
     restart: unless-stopped
     env_file:
-      - .env
+      - ./cache_api/.env
     environment:
       POSTGRES_HOST: db
     ports:
@@ -30,7 +30,7 @@ services:
       db:
         condition: service_healthy
     volumes:
-      - .:/code
+      - ./cache_api:/code
 
 volumes:
   pgdata:
