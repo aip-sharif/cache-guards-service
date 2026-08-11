@@ -91,9 +91,9 @@ def get_cache(db: Session, id: str, id_user: str):
     ).first()
 
 
-def get_cache_by_project_id(db: Session, project_id: str, id_user: str):
+def get_cache_by_project_id(db: Session, project_id: str):
     return db.exec(
-        select(Cache).where(Cache.project_id == project_id, Cache.id_user == id_user)
+        select(Cache).where(Cache.project_id == project_id)
     ).first()
 
 

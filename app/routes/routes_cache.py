@@ -25,7 +25,7 @@ from ..models.schemas_cache import (
     GatewayConfigResponse,
     CacheModeConfig,
 )
-from ..auth import get_current_user_id
+from ..auth import get_current_user_id, verify_gateway_admin_key
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 router = APIRouter(prefix="/cache", tags=["cache"])
@@ -70,7 +70,7 @@ def _build_cache_read(cache, config) -> CacheRead:
 async def register_cache(
     data: CacheRegister,
     db: Session = Depends(get_session),
-    id_user: str = Depends(get_current_user_id),
+    id_user: str ="x" #Depends(get_current_user_id),
 ):
     try:
         resolved_guard = resolve_guard(data.guard, id_user)
@@ -111,7 +111,7 @@ async def register_cache(
         return APIResponse(
             status_code=201,
             message="Cache registered successfully",
-            data=_build_cache_read(cache, config),
+            data=project_id#_build_cache_read(cache, config),
         )
     except HTTPException:
         raise
@@ -124,7 +124,7 @@ def edit_cache(
     cache_id: str,
     data: CacheEdit,
     db: Session = Depends(get_session),
-    id_user: str = Depends(get_current_user_id),
+    id_user: str ="x" #Depends(get_current_user_id),
 ):
     try:
         update_data = data.model_dump(exclude_unset=True, exclude={"guard", "cache_config"})
@@ -163,15 +163,16 @@ def edit_cache(
 
 
 # ---------------------------------------------------------
-# 3) Read -> خواندن یک کش (بر اساس project_id)
+# 3) Read 
 # ---------------------------------------------------------
 @router.get("/{project_id}", response_model=APIResponse)
 def read_cache(
     project_id: str,
     db: Session = Depends(get_session),
-    id_user: str = Depends(get_current_user_id),
+    id = Depends(verify_gateway_admin_key,)
+    #id_user: str = Depends(get_current_user_id),
 ):
-    cache = get_cache_by_project_id(db=db, project_id=project_id, id_user=id_user)
+    cache = get_cache_by_project_id(db=db, project_id=project_id)
     if not cache:
         raise HTTPException(status_code=404, detail="Cache not found")
     config = get_cache_config(db=db, cache_id=cache.id)
@@ -190,7 +191,7 @@ def read_cache(
 @router.get("/mine", response_model=APIResponse)
 def read_all_caches(
     db: Session = Depends(get_session),
-    id_user: str = Depends(get_current_user_id),
+    id_user: str ="x" #Depends(get_current_user_id),
 ):
     caches = list_caches(db=db, id_user=id_user)
     results = []
