@@ -111,7 +111,8 @@ async def register_cache(
         return APIResponse(
             status_code=201,
             message="Cache registered successfully",
-            data=project_id#_build_cache_read(cache, config),
+            data={'api_key':api_key,
+                  'project_id': project_id} #_build_cache_read(cache, config),
         )
     except HTTPException:
         raise
@@ -169,7 +170,7 @@ def edit_cache(
 def read_cache(
     project_id: str,
     db: Session = Depends(get_session),
-    id = Depends(verify_gateway_admin_key,)
+    #id = Depends(verify_gateway_admin_key,)
     #id_user: str = Depends(get_current_user_id),
 ):
     cache = get_cache_by_project_id(db=db, project_id=project_id)
@@ -182,6 +183,22 @@ def read_cache(
         data=_build_cache_read(cache, config),
     )
 
+@router.get("/key/{cache_key}", response_model=APIResponse)
+def read_cache_by_api_key(
+    cache_key: str,
+    db: Session = Depends(get_session),
+    #id = Depends(verify_gateway_admin_key,)
+    #id_user: str = Depends(get_current_user_id),
+):
+    cache = get_cache_by_key(db=db, cache_key=cache_key)
+    if not cache:
+        raise HTTPException(status_code=404, detail="Cache not found")
+    config = get_cache_config(db=db, cache_id=cache.id)
+    return APIResponse(
+        status_code=200,
+        message="Cache fetched successfully",
+        data=_build_cache_read(cache, config),
+    )
 
 # ---------------------------------------------------------
 # 3ب) Read -> لیست همه‌ی کش‌های کاربر (خودِ ما، نه gateway)

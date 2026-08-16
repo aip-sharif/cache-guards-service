@@ -16,6 +16,8 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    networks:
+      - shared_net
 
   api:
     build: ./cache_api
@@ -31,6 +33,14 @@ services:
         condition: service_healthy
     volumes:
       - ./cache_api:/code
+    networks:
+      shared_net:
+        aliases:
+          - app-config
 
 volumes:
   pgdata:
+
+networks:
+  shared_net:
+    external: true

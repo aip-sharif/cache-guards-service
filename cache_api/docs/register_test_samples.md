@@ -13,10 +13,10 @@ Content-Type: application/json
 
 ```json
 {
-  "llm_model": "gpt-x",
-  "llm_key": "sk-llm-test-1",
-  "embedd_model": "bge-m3",
-  "embedd_key": "sk-embed-test-1",
+  "llm_model": "rayen-qwen3.6-27b",
+  "llm_key": "sk-7HzxhsjUbhU4cPxs3ufNtg",
+  "embedd_model": "rayen-jina-v5",
+  "embedd_key": "sk-7HzxhsjUbhU4cPxs3ufNtg",
   "extaractor": null,
   "extaractor_key": null
 }
