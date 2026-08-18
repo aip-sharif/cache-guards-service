@@ -6,13 +6,14 @@ from datetime import datetime
 
 
 class APIResponse(BaseModel):
+    """پوششی یکدست برای همه‌ی جواب‌های موفق"""
     status_code: int
     message: str
     data: Optional[Any] = None
 
 
 # ---------------------------------------------------------
-# Guard 
+# Guard - همه‌ی فیلدهای مجاز طبق APP_INTEGRATION.md §2b
 # ---------------------------------------------------------
 _GUARD_KNOWN_FIELDS = {
     "enabled", "policy",
@@ -30,6 +31,8 @@ class GuardConfig(BaseModel):
     enabled: Optional[bool] = None
     policy: Optional[str] = None
 
+    # مدل‌های guard - باید صریحاً داده بشن، fallback به embedd_model خودِ
+    # کلاینت باعث embed_unreachable سمت gateway می‌شه (وقتی guard فعاله)
     embed_model: Optional[str] = None
     embed_api_key: Optional[str] = None
     embed_prefix_style: str = "none"  # "none" | "e5"
@@ -39,7 +42,8 @@ class GuardConfig(BaseModel):
     judge_task_description: str = "a customer support assistant"
     judge_max_concurrency: int = 4
 
-    mode: Optional[str] = None  # cascade | embedding-only | judge-only | max
+    # آستانه‌ها
+    mode: str = "embedding-only"  # cascade | embedding-only | judge-only | max
     top_k: int = 8
     min_similarity: float = 0.60
     block_threshold: float = 0.85
@@ -47,10 +51,12 @@ class GuardConfig(BaseModel):
     judge_block_threshold: float = 0.60
     judge_allow_threshold: float = 0.40
 
+    # چه چیزی چک بشه
     check_roles: List[str] = ["user", "system", "tool"]
     max_segments: int = 32
     max_input_chars: int = 16000
 
+    # رفتار موقع خرابی
     degrade_to_unguarded: bool = False
     unavailable_response: str = "error"  # "error" | "refusal"
     unavailable_refusal: Optional[str] = None
@@ -58,7 +64,7 @@ class GuardConfig(BaseModel):
     log_turn_text: bool = False
 
     class Config:
-        extra = "allow"  
+        extra = "allow"  # برای پذیرفتن x_* بدون خطا؛ چک واقعی در validator زیره
 
     @model_validator(mode="after")
     def _reject_unknown_fields(self):
@@ -78,6 +84,24 @@ class GuardConfig(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _require_judge_when_mode_needs_it(self):
+        # همون قانونی که gateway هم اعمال می‌کنه: اگه mode بتونه judge رو
+        # صدا بزنه، judge_model و judge_api_key باید حتماً پر باشن -
+        # اینجا زودتر (موقع register/edit) گیرش می‌ندازیم، نه بعداً سمت gateway.
+        if self.mode in ("cascade", "judge-only", "max"):
+            if not self.judge_model or not self.judge_api_key:
+                from fastapi import HTTPException
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"guard.mode='{self.mode}' can invoke the judge, so both "
+                        "guard.judge_model and guard.judge_api_key are required "
+                        "(use mode='embedding-only' for a judge-free guard)"
+                    ),
+                )
+        return self
+
 
 class SemanticConfig(BaseModel):
     similarity_threshold: float = 0.92
@@ -94,6 +118,8 @@ class FuzzyConfig(BaseModel):
 
 
 class CacheModeConfig(BaseModel):
+    """اختیاری - در صورت نبود، مقادیر پیش‌فرض استفاده می‌شن.
+    cache_mode می‌تونه یک رشته (یک متد) یا لیست (زنجیره) باشه."""
     cache_mode: Union[str, List[str]] = ["exact", "bm25", "fuzzy", "semantic"]
     semantic: SemanticConfig = SemanticConfig()
     bm25: Bm25Config = Bm25Config()
@@ -127,6 +153,10 @@ class CacheEdit(BaseModel):
 
 
 class GatewayConfigResponse(BaseModel):
+    """
+    فرمت دقیقی که gateway از GET /cache انتظار داره -
+    از روی Cache + CacheConfig ساخته می‌شه.
+    """
     model: str
     model_api_key: str
     embed_model: str
@@ -154,6 +184,7 @@ class CacheRead(BaseModel):
     extaractor_key: Optional[str] = None
     extractor_domain: Optional[str] = None
     created_at: datetime
+    # از جدول جدای CacheConfig پر می‌شه؛ اگه غیرفعال باشه null است
     guard: Optional[dict] = None
     cache_config: Optional[CacheModeConfig] = None
 

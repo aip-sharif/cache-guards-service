@@ -1,4 +1,7 @@
 # guard_utils.py
+"""
+منطق سه‌حالته‌ی guard + اعتبارسنجی سند policy طبق APP_INTEGRATION.md §2b
+"""
 
 import logging
 import re
@@ -15,14 +18,19 @@ _ANCHOR_OR_ALIAS_RE = re.compile(r"(^|\s)[&*][A-Za-z0-9_-]+")
 
 
 def _has_yaml_anchors_or_aliases(raw_policy: str) -> bool:
+    """چک سطحی برای رد کردن anchor/alias های YAML (&name / *name)"""
     for line in raw_policy.splitlines():
-        stripped = line.split("#", 1)[0]  
+        stripped = line.split("#", 1)[0]  # کامنت‌ها رو نادیده بگیر
         if _ANCHOR_OR_ALIAS_RE.search(stripped):
             return True
     return False
 
 
 def validate_policy(policy: str) -> None:
+    """
+    اگه policy مشکلی داشته باشه HTTPException(502) با پیام دقیق می‌ندازه.
+    اگه سالم بود، هیچی برنمی‌گردونه (silently ok).
+    """
     if not policy or not policy.strip():
         raise HTTPException(status_code=502, detail="guard.policy is empty")
 
@@ -110,22 +118,39 @@ def validate_policy(policy: str) -> None:
 
 
 def resolve_guard(guard, client_id: str):
+    """
+    guard: یه GuardConfig (با enabled: Optional[bool], policy: Optional[str], ...) یا None.
+    خروجی: همون guard (اگه روشنه) یا None (اگه خاموشه) - یا HTTPException(502) می‌ندازه.
+    """
+    # حالت ۱: guard نیامده، یا {} (یعنی enabled و policy هر دو None)
     if guard is None or (guard.enabled is None and not guard.policy):
         return None
 
+    # حالت ۴: policy اومده ولی enabled نیامده - رد می‌کنیم، حدس نمی‌زنیم
     if guard.enabled is None and guard.policy:
         raise HTTPException(
             status_code=502,
             detail="guard.policy provided without 'enabled' - refusing to guess the intent",
         )
 
+    # حالت ۲: enabled صریحاً false
     if guard.enabled is False:
         logger.warning("guard explicitly disabled by client id_user=%s", client_id)
         return None
 
-
+    # حالت ۳/۵: enabled صریحاً true
     if guard.enabled is True:
-        validate_policy(guard.policy) 
+        validate_policy(guard.policy)  # اگه مشکلی باشه اینجا 502 می‌ندازه
+
+        # guard باید مدل embedding خودش رو صریحاً داشته باشه - fallback به
+        # embedd_model خودِ کلاینت باعث خطای embed_unreachable سمت gateway می‌شه
+        if not guard.embed_model or not guard.embed_api_key:
+            raise HTTPException(
+                status_code=502,
+                detail="guard.enabled=true requires both guard.embed_model "
+                "and guard.embed_api_key to be provided explicitly",
+            )
+
         return guard
 
     return None

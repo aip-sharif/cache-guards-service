@@ -1,5 +1,6 @@
 # main.py
 
+import logging
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import HTTPException
@@ -7,6 +8,16 @@ from contextlib import asynccontextmanager
 
 from app.utils.db_utils import create_db_and_tables
 from app.routes.routes_cache import router as cache_router
+
+# بدون این، logger.info(...) هیچ‌جا چاپ نمی‌شه (سطح پیش‌فرض WARNING هست).
+# force=True لازمه چون uvicorn قبل از import شدن main.py خودش root logger
+# رو با handler تنظیم می‌کنه، و basicConfig بدون force اگه handler از قبل
+# باشه هیچ کاری نمی‌کنه (بی‌صدا skip می‌شه).
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    force=True,
+)
 
 
 @asynccontextmanager
@@ -24,6 +35,7 @@ app = FastAPI(
 app.include_router(cache_router)
 
 
+# فرمت یکدست برای همه‌ی خطاها - status_code + message
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse(

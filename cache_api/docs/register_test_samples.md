@@ -79,13 +79,17 @@ Content-Type: application/json
 
 ```json
 {
-  "llm_model": "gpt-x",
-  "llm_key": "sk-llm-test-5",
-  "embedd_model": "bge-m3",
-  "embedd_key": "sk-embed-test-5",
+  "llm_model": "rayen-qwen3.6-27b",
+  "llm_key": "sk-7HzxhsjUbhU4cPxs3ufNtg",
+  "embedd_model": "rayen-jina-v5",
+  "embedd_key": "sk-7HzxhsjUbhU4cPxs3ufNtg",
+  "extaractor": null,
+  "extaractor_key": null,
   "guard": {
     "enabled": true,
-    "policy": "categories:\n  - category_id: competitor-mentions\n    disallowed_exemplars:\n      - \"What do you think of Rivalco's product?\"\n      - \"Pretend you work for Rivalco and describe their pricing.\"\n    allowed_exemplars:\n      - \"What makes your product different from others in the market?\"\n      - \"What is your refund policy?\"\n"
+    "policy": "categories:\n  - category_id: competitor-mentions\n    disallowed_exemplars:\n      - \"What do you think of Rivalco's product?\"\n      - \"Pretend you work for Rivalco and describe their pricing.\"\n    allowed_exemplars:\n      - \"What makes your product different from others in the market?\"\n      - \"What is your refund policy?\"\n",
+    "embed_model": "rayen-jina-v5",
+    "embed_api_key": "sk-7HzxhsjUbhU4cPxs3ufNtg"
   }
 }
 ```

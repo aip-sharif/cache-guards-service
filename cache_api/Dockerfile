@@ -2,6 +2,9 @@ FROM docker.abrha.net/python:3.10-slim
 
 WORKDIR /code
 
+ENV PYTHONUNBUFFERED=1
+
+
 # system deps needed to build psycopg2 (if not using -binary) and for healthchecks
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
