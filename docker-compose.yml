@@ -1,6 +1,174 @@
+# Service names are short (api / redis / postgres) so DSNs and hostnames read
+# cleanly; container names are all prefixed `semantic-cache-` so they are easy
+# to spot in `docker ps`.
+#
+# This stack has two halves:
+#   - semantic-cache: api / redis / postgres  -> the cache + gateway itself
+#   - app:            app-db / app            -> the APP that mints/validates
+#     client keys and serves SC_APP_CONFIG_URL (reachable on the network via
+#     the `app-config` alias below). This is the same "APP" referenced in the
+#     api service's env comments.
 services:
-  db:
+  # The API service: SaaS cache routes + the OpenAI-compatible gateway.
+  # Whole stack:            docker compose up -d --build
+  # ...with local Postgres: docker compose --profile local-pg up -d --build
+  api:
+    build:
+      context: ./cache_as_service
+      dockerfile: Dockerfile
+    container_name: semantic-cache-api
+    # Host port is configurable; the app always listens on 8080 in-container.
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    environment:
+      # HTTP_PROXY: "http://host.docker.internal:10809"
+      # HTTPS_PROXY: "http://host.docker.internal:10809"
+      # http_proxy: "http://host.docker.internal:10809"
+      # https_proxy: "http://host.docker.internal:10809"
+
+      # # استثنا کردن دات‌نت و دیتابیس‌های داخلی کانتینر
+      # NO_PROXY: "localhost,127.0.0.1,redis,postgres,semantic-cache-redis,semantic-cache-postgres,api,db,app-config,172.16.0.0/12,192.168.0.0/16,10.0.0.0/8,.local,shared_net"
+      # no_proxy: "localhost,127.0.0.1,redis,postgres,semantic-cache-redis,semantic-cache-postgres,api,db,app-config,172.16.0.0/12,192.168.0.0/16,10.0.0.0/8,.local,shared_net"
+
+      SC_REDIS_HOST: redis
+      # Read the Redis port from the environment (see .env / REDIS_PORT),
+      # defaulting to 6379. Must match what the redis service binds below.
+      SC_REDIS_PORT: "${REDIS_PORT:-6379}"
+      SC_EXACT_TIER: "true"
+      # Embeddings are API-based (OpenRouter / mlops / any OpenAI-compatible
+      # endpoint) — no local model in the image. This shared embedder serves
+      # the SaaS tenant caches; the gateway uses per-project embed models
+      # from the APP. Defaults to the gateway's mlops embed endpoint.
+      SC_EMBEDDING_PROVIDER: "${SC_EMBEDDING_PROVIDER:-custom_api}"
+      SC_EMBEDDING_BASE_URL: "${SC_EMBEDDING_BASE_URL:-${SC_EMBED_BASE_URL:-}}"
+      SC_EMBEDDING_API_KEY: "${SC_EMBEDDING_API_KEY:-}"
+      SC_EMBEDDING_MODEL: "${SC_EMBEDDING_MODEL:-}"
+      SC_LOG_LEVEL: "${SC_LOG_LEVEL:-INFO}"
+      SC_ENVIRONMENT: "${SC_ENVIRONMENT:-production}"
+      # Error reporting (optional). Set SC_SENTRY_DSN in your .env to enable.
+      SC_SENTRY_DSN: "${SC_SENTRY_DSN:-}"
+      # OpenAI-compatible gateway (optional). Mounts /v1/chat/completions when
+      # ALL FOUR are set: an existing Postgres, the APP's config endpoint, and
+      # the mlops chat + embedding endpoints. The APP mints and validates the
+      # client keys — this service never does, so there is no admin/mint token
+      # for the gateway.
+      SC_PG_DSN: "${SC_PG_DSN:-}"
+      # The `app` service below (aliased `app-config` on shared_net) is this
+      # APP. Point this at its config route, e.g. http://app-config:8000/config
+      SC_APP_CONFIG_URL: "${SC_APP_CONFIG_URL:-}"
+      SC_APP_CONFIG_TTL: "${SC_APP_CONFIG_TTL:-60}"
+      SC_LLM_BASE_URL: "${SC_LLM_BASE_URL:-}"
+      SC_EMBED_BASE_URL: "${SC_EMBED_BASE_URL:-}"
+      SC_EXTRACTOR_BASE_URL: "${SC_EXTRACTOR_BASE_URL:-}"
+      # Input guard (optional). Whether a client is guarded — and with which
+      # embedding/judge models — comes from the APP's config response, so the
+      # guard adds NO required variable here. These are operator limits and
+      # break-glass only. The guard is deliberately NOT wired into the
+      # healthcheck below: with restart: unless-stopped, a judge outage would
+      # otherwise become a container restart loop.
+      SC_GUARD_ENABLED: "${SC_GUARD_ENABLED:-true}"
+      SC_GUARD_TIMEOUT: "${SC_GUARD_TIMEOUT:-5.0}"
+      SC_GUARD_BUILD_TIMEOUT: "${SC_GUARD_BUILD_TIMEOUT:-60.0}"
+      SC_GUARD_MAX_EXEMPLARS: "${SC_GUARD_MAX_EXEMPLARS:-5000}"
+      SC_GUARD_MAX_POLICY_BYTES: "${SC_GUARD_MAX_POLICY_BYTES:-262144}"
+      SC_GUARD_CACHE_MAX_BYTES: "${SC_GUARD_CACHE_MAX_BYTES:-268435456}"
+      SC_GUARD_SEGMENT_MEMO_SIZE: "${SC_GUARD_SEGMENT_MEMO_SIZE:-50000}"
+      # Both fall back to SC_EMBED_BASE_URL / SC_LLM_BASE_URL when unset.
+      SC_GUARD_EMBED_BASE_URL: "${SC_GUARD_EMBED_BASE_URL:-}"
+      SC_GUARD_JUDGE_BASE_URL: "${SC_GUARD_JUDGE_BASE_URL:-}"
+      # Bearer for the SaaS multi-tenant admin routes (tenant creation) only —
+      # NOT used by the OpenAI gateway. Unset → SaaS admin disabled.
+      SC_ADMIN_API_KEY: "${SC_ADMIN_API_KEY:-}"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      # Not required to start (no healthcheck defined on `app`), but the
+      # gateway's config polling needs it up sooner rather than later.
+      app:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health').status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    restart: unless-stopped
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+    networks:
+      - shared_net
+
+  redis:
+    image: redis/redis-stack-server:latest
+    container_name: semantic-cache-redis
+    # Redis binds AND publishes on ${REDIS_PORT} (default 6379). One variable
+    # drives the container port, the published port, and the healthcheck.
+    ports:
+      - "${REDIS_PORT:-6379}:${REDIS_PORT:-6379}"
+    volumes:
+      - redis_data:/data
+    # High Standard Persistence Configuration:
+    # --appendonly yes: Enables AOF (Append Only File) to log every write operation.
+    # --save 60 1: Saves an RDB snapshot if at least 1 key changed in 60 seconds (useful for backups).
+    # --protected-mode no: with a custom command the redis-stack defaults are
+    # bypassed and protected mode comes back ON, which rejects the app
+    # container's connection (it is not loopback). Safe here: Redis is only
+    # reachable on the compose network + the published port you choose.
+    command: >
+      redis-server
+      --port ${REDIS_PORT:-6379}
+      --loadmodule /opt/redis-stack/lib/redisearch.so
+      --loadmodule /opt/redis-stack/lib/rejson.so
+      --appendonly yes
+      --save 60 1
+      --protected-mode no
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "${REDIS_PORT:-6379}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - shared_net
+
+  # An ordinary Postgres so the stack runs with no external database. It
+  # stores the gateway's projects + hashed keys, the message log, and the
+  # cache backup. Match it in .env:
+  #   SC_PG_DSN=postgresql://scuser:scpass@postgres:5432/sccache
+  # (host = the SERVICE name `postgres`, and always port 5432 — the
+  # in-container port; PG_PORT only changes what is published to your host.)
+  # In PRODUCTION, point SC_PG_DSN at your OWN Postgres and remove this
+  # service (or don't publish PG_PORT).
+  postgres:
+    image: postgres:16-alpine
+    container_name: semantic-cache-postgres
+    environment:
+      POSTGRES_USER: scuser
+      POSTGRES_PASSWORD: scpass
+      POSTGRES_DB: sccache
+    ports:
+      - "${PG_PORT:-5432}:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scuser -d sccache"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - shared_net
+
+  # --- APP (the config/keys service the gateway above talks to) ---
+
+  # Postgres for the APP. Renamed to `app-db` (was `db`) to avoid colliding
+  # with the semantic-cache `postgres` service above — both stacks are now
+  # in one file. Uses its own custom port 1379 as in the original app compose.
+  app-db:
     image: postgres:15
+    container_name: cache-app-db
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
@@ -10,7 +178,7 @@ services:
     ports:
       - "1379:1379"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - app_pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB} -p 1379"]
       interval: 5s
@@ -19,17 +187,21 @@ services:
     networks:
       - shared_net
 
-  api:
+  # The APP itself. Renamed to `app` (was `api`) to avoid colliding with the
+  # semantic-cache `api` service above. Keeps its `app-config` network alias
+  # so the semantic-cache api's SC_APP_CONFIG_URL keeps resolving.
+  app:
     build: ./cache_api
+    container_name: cache-app
     restart: unless-stopped
     env_file:
       - ./cache_api/.env
     environment:
-      POSTGRES_HOST: db
+      POSTGRES_HOST: app-db
     ports:
       - "8000:8000"
     depends_on:
-      db:
+      app-db:
         condition: service_healthy
     volumes:
       - ./cache_api:/code
@@ -38,8 +210,16 @@ services:
         aliases:
           - app-config
 
+# Persistent volumes. Even if a container is destroyed, the data lives on the
+# host (Docker named-volume driver): Redis replays its AOF/RDB on next start,
+# and Postgres keeps its tables.
 volumes:
-  pgdata:
+  redis_data:
+    driver: local
+  pg_data:
+    driver: local
+  app_pgdata:
+    driver: local
 
 networks:
   shared_net:

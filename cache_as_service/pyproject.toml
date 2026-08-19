@@ -1,0 +1,103 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "semantic-cache"
+version = "0.4.0"
+description = "Vector-based semantic cache for LLM responses, with optional entity-aware safety layer for high-stakes domains (medical, legal)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "DML" }]
+keywords = ["llm", "cache", "redis", "vector", "embedding", "rag", "medical", "legal"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database :: Database Engines/Servers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# Core runtime: everything needed for the sync flow with the default
+# HuggingFace embedding backend disabled (caller plugs their own).
+dependencies = [
+    "redis>=5.0",
+    "numpy>=1.24",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "requests>=2.28",
+    # Guard policies arrive from the APP as inline YAML. Core, not an extra:
+    # the image installs [fastapi,async,sentry,postgres] while CI installs
+    # [async,fastapi,postgres,metrics,translate,dev], so core is the only set
+    # both share — anywhere else and the guard breaks in exactly one of them.
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# Heavy local embedding model. Skip if you use APIEmbeddingManager.
+embeddings = ["sentence-transformers>=2.2"]
+# FastAPI HTTP adapter.
+fastapi = ["fastapi>=0.100", "uvicorn>=0.23"]
+# LangChain BaseCache adapter.
+langchain = ["langchain-core>=0.1"]
+# Cross-lingual normalization via deep-translator (Google translate).
+translate = ["deep-translator>=1.11"]
+# Prometheus metrics exposition.
+metrics = ["prometheus-client>=0.18"]
+# Native async LLM extractor + async manager methods.
+async = ["httpx>=0.25"]
+# Sentry error reporting for the SaaS server.
+sentry = ["sentry-sdk[fastapi]>=2.0"]
+# OpenAI-compatible gateway: Postgres registry/keys/message-log.
+postgres = ["psycopg[binary,pool]>=3.1"]
+# Dev / test.
+dev = [
+    "pytest>=7",
+    "pytest-asyncio>=0.21",
+    "pytest-cov>=4",
+    "pytest-mock>=3",
+]
+# Convenience meta-extra.
+all = [
+    "sentence-transformers>=2.2",
+    "fastapi>=0.100",
+    "uvicorn>=0.23",
+    "langchain-core>=0.1",
+    "deep-translator>=1.11",
+    "prometheus-client>=0.18",
+    "httpx>=0.25",
+    "sentry-sdk[fastapi]>=2.0",
+    "psycopg[binary,pool]>=3.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/your-org/semantic-cache"
+Issues = "https://github.com/your-org/semantic-cache/issues"
+
+# Standard flat layout: the importable package lives in ./semantic_cache/.
+# Sub-packages are listed explicitly to keep the install footprint tight
+# (tests/ is excluded).
+[tool.setuptools]
+packages = [
+    "semantic_cache",
+    "semantic_cache.core",
+    "semantic_cache.infrastructure",
+    "semantic_cache.adapters",
+    "semantic_cache.saas",
+    "semantic_cache.gateway",
+]
+
+[tool.setuptools.package-data]
+semantic_cache = ["py.typed"]
+
+# The test suite is unit-only: no Redis, no model, no network — so `pytest` is
+# green on a bare checkout and in CI.
+[tool.pytest.ini_options]
+testpaths = ["tests/unit"]
+asyncio_mode = "auto"

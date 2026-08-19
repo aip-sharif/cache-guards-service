@@ -1,0 +1,39 @@
+# Secrets — keep .env.example checked in, but never commit a real .env.
+.env
+.env.local
+.env.*.local
+
+# Python build / install artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+*.egg
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# IDE / OS noise
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Repo-local scratch (not part of the service) — but versioned docs are
+# whitelisted below (ignore the CONTENTS, not the dir, so negation works).
+Docs/*
+docs/*
+!Docs/APP_INTEGRATION.md
+!docs/APP_INTEGRATION.md
+!Docs/RUNNING_LOCALLY.md
+!docs/RUNNING_LOCALLY.md
+Poc/

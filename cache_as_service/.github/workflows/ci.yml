@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Unit tests only: no Redis, no embedding model, no network. Runs on a bare
+  # runner across the supported Python matrix in seconds. `pytest` collects
+  # tests/unit/ (see pyproject testpaths).
+  unit:
+    name: unit (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # fastapi + postgres are needed to COLLECT the gateway suite:
+      # tests/unit/test_gateway_router_unit.py imports fastapi at module scope.
+      - name: Install (core + async + fastapi + postgres + metrics + translate + dev)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[async,fastapi,postgres,metrics,translate,dev]"
+
+      - name: Run unit tests
+        run: pytest -v
