@@ -2,7 +2,7 @@
 .env
 .env.*
 !.env.example
-
+graphify-out/
 # Python
 __pycache__/
 *.py[cod]
