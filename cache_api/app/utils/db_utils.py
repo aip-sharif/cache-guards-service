@@ -33,16 +33,6 @@ def get_user(db: Session, id: str):
     return db.exec(select(User).where(User.id == id)).first()
 
 
-def update_user_access(db: Session, id: str, access: str):
-    user = get_user(db, id)
-    if not user:
-        return None
-    user.access = access
-    db.commit()
-    db.refresh(user)
-    return user
-
-
 # ---------------------------
 # Cache CRUD
 # ---------------------------
@@ -61,6 +51,7 @@ def create_cache(
     extaractor_key: str = None,
     extractor_domain: str = None,
     id: str = None,
+    commit: bool = True,
 ):
     if not get_user(db, id_user):
         create_user(db, id=id_user)
@@ -80,8 +71,11 @@ def create_cache(
         extractor_domain=extractor_domain,
     )
     db.add(cache)
-    db.commit()
-    db.refresh(cache)
+    if commit:
+        db.commit()
+        db.refresh(cache)
+    else:
+        db.flush()  # id رو بدون commit در دسترس می‌ذاره (برای FK بعدی لازمه)
     return cache
 
 
@@ -91,19 +85,48 @@ def get_cache(db: Session, id: str, id_user: str):
     ).first()
 
 
-def get_cache_by_project_id(db: Session, project_id: str):
+def get_cache_by_project_id(db: Session, project_id: str, id_user: str):
+    """
+    [S01 FIX] این تابع همیشه id_user رو هم فیلتر می‌کنه - یعنی حتی اگه
+    یکی project_id واقعی یه پروژه‌ی دیگه رو حدس بزنه، تا وقتی مالکش
+    نباشه چیزی برنمی‌گرده (به‌جای اینکه فقط project_id چک بشه).
+    """
     return db.exec(
-        select(Cache).where(Cache.project_id == project_id)
+        select(Cache).where(Cache.project_id == project_id, Cache.id_user == id_user)
     ).first()
 
 
 def get_cache_by_key(db: Session, cache_key: str):
-    """برای endpoint config که gateway با پروژه‌کی (project's own key) صداش می‌زنه"""
     return db.exec(select(Cache).where(Cache.cache_key == cache_key)).first()
 
 
+def list_caches(db: Session, id_user: str):
+    return db.exec(select(Cache).where(Cache.id_user == id_user)).all()
+
+
+def update_cache(db: Session, id: str, id_user: str, data: dict):
+    cache = get_cache(db, id, id_user)
+    if not cache:
+        return None
+    for key, value in data.items():
+        if value is not None and hasattr(cache, key):
+            setattr(cache, key, value)
+    db.commit()
+    db.refresh(cache)
+    return cache
+
+
+def delete_cache(db: Session, id: str, id_user: str):
+    cache = get_cache(db, id, id_user)
+    if not cache:
+        return False
+    db.delete(cache)
+    db.commit()
+    return True
+
+
 # ---------------------------
-# CacheConfig CRUD (guard + cache_config)
+# CacheConfig CRUD
 # ---------------------------
 
 def create_cache_config(
@@ -116,6 +139,7 @@ def create_cache_config(
     semantic: dict = None,
     bm25: dict = None,
     fuzzy: dict = None,
+    commit: bool = True,
 ):
     kwargs = {}
     if cache_mode is not None:
@@ -137,8 +161,11 @@ def create_cache_config(
         **kwargs,
     )
     db.add(config)
-    db.commit()
-    db.refresh(config)
+    if commit:
+        db.commit()
+        db.refresh(config)
+    else:
+        db.flush()
     return config
 
 
@@ -156,33 +183,6 @@ def update_cache_config(db: Session, cache_id: str, data: dict):
     db.commit()
     db.refresh(config)
     return config
-
-
-def list_caches(db: Session, id_user: str):
-    return db.exec(select(Cache).where(Cache.id_user == id_user)).all()
-
-
-def update_cache(db: Session, id: str, id_user: str, data: dict):
-    cache = get_cache(db, id, id_user)
-    if not cache:
-        return None
-
-    for key, value in data.items():
-        if value is not None and hasattr(cache, key):
-            setattr(cache, key, value)
-
-    db.commit()
-    db.refresh(cache)
-    return cache
-
-
-def delete_cache(db: Session, id: str, id_user: str):
-    cache = get_cache(db, id, id_user)
-    if not cache:
-        return False
-    db.delete(cache)
-    db.commit()
-    return True
 
 
 class DBUpsertError(Exception):

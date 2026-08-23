@@ -17,14 +17,20 @@ class User(SQLModel, table=True):
 class Cache(SQLModel, table=True):
     id: str = Field(default=None, primary_key=True)
     name: str = Field(default_factory=lambda: f'model_{random()}')
-    id_user: str = Field(default=None, foreign_key="user.id", nullable=False)
+    id_user: str = Field(default=None, foreign_key="user.id", nullable=False, index=True)
 
     embedd_model: str = Field(default=None, nullable=False)
     embedd_key: str = Field(default=None, nullable=False)
     llm_model: str = Field(default=None, nullable=False)
     llm_key: str = Field(default=None, nullable=False)
-    cache_key: str = Field(default=None, nullable=True)
-    project_id: str = Field(default=None, nullable=True)
+
+    # [R04 FIX] cache_key و project_id قبلاً nullable و بدون unique/index
+    # بودن - یعنی تئوریاً می‌شد دو ردیف با همون project_id/cache_key
+    # ساخت (تصادم lookup) یا NULL گذاشت. الان هم اجباری (nullable=False)
+    # هم یکتا (unique=True) و ایندکس‌دار هستن (lookup سریع‌تر هم می‌شه).
+    cache_key: str = Field(default=None, nullable=False, unique=True, index=True)
+    project_id: str = Field(default=None, nullable=False, unique=True, index=True)
+
     extaractor: str = Field(default=None, nullable=True)
     extaractor_key: str = Field(default=None, nullable=True)
     extractor_domain: str = Field(default=None, nullable=True)
@@ -34,7 +40,7 @@ class Cache(SQLModel, table=True):
 
 class CacheConfig(SQLModel, table=True):
     id: str = Field(default=None, primary_key=True)
-    cache_id: str = Field(default=None, foreign_key="cache.id", nullable=False, unique=True)
+    cache_id: str = Field(default=None, foreign_key="cache.id", nullable=False, unique=True, index=True)
 
     guard_enabled: bool = Field(default=False, nullable=False)
     guard_policy: str = Field(default=None, nullable=True)
