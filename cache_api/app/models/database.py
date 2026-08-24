@@ -2,7 +2,7 @@ from sqlmodel import SQLModel, Field, Column, JSON
 from random import random
 from datetime import datetime, timezone
 from typing import List, Optional
-
+from ..utils.crypto_utils import EncryptedString
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -20,9 +20,10 @@ class Cache(SQLModel, table=True):
     id_user: str = Field(default=None, foreign_key="user.id", nullable=False, index=True)
 
     embedd_model: str = Field(default=None, nullable=False)
-    embedd_key: str = Field(default=None, nullable=False)
+    # [S04 FIX] کلیدهای provider حالا encrypt-at-rest هستن (EncryptedString)
+    embedd_key: str = Field(default=None, nullable=False, sa_column=Column(EncryptedString))
     llm_model: str = Field(default=None, nullable=False)
-    llm_key: str = Field(default=None, nullable=False)
+    llm_key: str = Field(default=None, nullable=False, sa_column=Column(EncryptedString))
 
     # [R04 FIX] cache_key و project_id قبلاً nullable و بدون unique/index
     # بودن - یعنی تئوریاً می‌شد دو ردیف با همون project_id/cache_key
