@@ -21,9 +21,9 @@ class Cache(SQLModel, table=True):
 
     embedd_model: str = Field(default=None, nullable=False)
     # [S04 FIX] کلیدهای provider حالا encrypt-at-rest هستن (EncryptedString)
-    embedd_key: str = Field(default=None, nullable=False, sa_column=Column(EncryptedString))
+    embedd_key: str = Field(default=None, sa_column=Column(EncryptedString, nullable=False))
     llm_model: str = Field(default=None, nullable=False)
-    llm_key: str = Field(default=None, nullable=False, sa_column=Column(EncryptedString))
+    llm_key: str = Field(default=None, sa_column=Column(EncryptedString, nullable=False))
 
     # [R04 FIX] cache_key و project_id قبلاً nullable و بدون unique/index
     # بودن - یعنی تئوریاً می‌شد دو ردیف با همون project_id/cache_key
