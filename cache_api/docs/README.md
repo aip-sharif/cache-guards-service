@@ -1,74 +1,77 @@
-# Cache Service
+# Cache Service (cache_api)
 
-A FastAPI service that lets clients (via a caching "APP") register LLM/embedding
-model credentials, cache-behavior settings, and an optional input guard, then
-exposes a config endpoint that an OpenAI-compatible **gateway** calls to
-resolve a client's setup — following the `APP_INTEGRATION.md` contract.
+A FastAPI service that lets clients (via an intermediary "APP") register LLM/embedding
+model credentials, cache behavior settings, and an optional guard, then exposes an
+endpoint an OpenAI-compatible **gateway** calls to resolve that configuration.
 
 ---
 
 ## Architecture
 
-- **FastAPI + SQLModel** — API layer and ORM
-- **PostgreSQL** — persistence (`user`, `cache`, `cacheconfig` tables)
-- **Casdoor** — end-user authentication (JWT via cookie or `Authorization` header)
-- **Gateway integration** — a separate OpenAI-compatible gateway calls
-  `GET /cache` with the client's own key to resolve model configs, cache
-  behavior, and guard settings
-
 ```
 Client → POST /cache/register (Casdoor auth)
-       → mints project_id + cache_key locally, stores config
+       → mints a local id/project_id/cache_key, stores config
 
-Gateway → GET /cache (Authorization: Bearer <client's cache_key>)
-        → returns { model, model_api_key, embed_model, embed_api_key,
-                     extractor_model, extractor_api_key, extractor_domain,
-                     project_id, cache_config, guard }
+Gateway → GET /cache   (Authorization: Bearer <the project's own cache_key>)
+        → { model, model_api_key, embed_model, embed_api_key,
+            extractor_model, extractor_api_key, extractor_domain,
+            project_id, cache_config, guard }
 ```
+
+- **FastAPI + SQLModel** — API layer and ORM
+- **PostgreSQL** — primary database (`user`, `cache`, `cacheconfig`)
+- **Casdoor** — end-user authentication (JWT, via cookie or `Authorization` header)
+- **Alembic** — schema management (replacing `create_all` at startup)
 
 ---
 
 ## Project layout
 
 ```
-caching/                       (repo root)
-  docker-compose.yml
-  cache_api/                   (everything the api container needs)
-    Dockerfile
-    main.py
-    requirements.txt
+caching/                          (repo root)
+  docker-compose.yml              (Postgres not published by default)
+  docker-compose.override.yml     (dev-only - opens the Postgres port)
+  cache_api/
+    Dockerfile                    (non-root user + HEALTHCHECK)
+    requirements.in               (source deps - unpinned)
+    requirements.lock.txt          (pinned + hashed - install this one)
     .env
+    alembic.ini
+    alembic/
+      env.py
+      script.py.mako
+      versions/
     app/
-      auth.py                  # Casdoor auth + admin-key dependency
-      config.py                # reads .env
+      auth.py                     (Casdoor + admin-key auth)
+      config.py                   (reads .env)
+      crypto_utils.py             (at-rest encryption for provider keys)
+      rate_limit.py               (rate limiting + body size limit)
       models/
-        database.py            # SQLModel tables: User, Cache, CacheConfig
-        schemas_cache.py        # Pydantic request/response schemas
+        database.py               (User, Cache, CacheConfig)
+        schemas_cache.py          (request/response schemas + GuardConfig)
       routes/
-        routes_cache.py         # /cache/* endpoints
+        routes_cache.py           (all /cache/* endpoints)
       utils/
-        db_utils.py             # DB CRUD helpers
-        guard_utils.py          # three-state guard resolution + policy validation
+        db_utils.py               (database CRUD)
+        guard_utils.py            (three-state guard logic + policy validation)
+        proxy_utils.py            (direct proxy to the client's own mlops endpoint)
     tests/
       conftest.py
       test_cache.py
-  .github/
-    workflows/
-      ci.yml
+      test_security.py            (security regression tests)
+  .github/workflows/ci.yml
 ```
 
 ---
 
 ## Setup
 
-### 1. Configure `cache_api/.env`
+### 1. `.env` (inside `cache_api/`)
 
 ```dotenv
 POSTGRES_USER=postgres
 POSTGRES_PASSWORD=postgres
 POSTGRES_DB=mydb
-POSTGRES_PORT=1379
-POSTGRES_HOST=localhost
 DATABASE_URL=postgresql://postgres:postgres@db:1379/mydb
 
 CLIENT_ID=your-casdoor-client-id
@@ -78,28 +81,39 @@ APPLICATION_NAME=app-built-in
 ORGANZATION_NAME=built-in
 CERT=app/cert.pem
 
-SC_GATEWAY_ADMIN_KEY=your-admin-key   # only needed if using verify_gateway_admin_key
+SC_GATEWAY_ADMIN_KEY=your-admin-key
+SC_DB_ENCRYPTION_KEY=your-fernet-key   # generate with the command below
+
+SC_LLM_BASE_URL=https://your-mlops-host.com
+SC_EMBED_BASE_URL=https://your-mlops-host.com
+
+# dev only - auto-creates tables without Alembic. Remove this in production
+# and run `alembic upgrade head` as a deploy step instead.
+SC_ENVIRONMENT=development
 ```
 
-> `POSTGRES_PORT` here is a convention only — Postgres inside the `db`
-> container actually listens on the port passed via
-> `command: ["postgres", "-p", "<PORT>"]` in `docker-compose.yml`. Keep both
-> in sync if you change it.
+Generate `SC_DB_ENCRYPTION_KEY`:
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+⚠️ Don't lose this key — without the exact same key, previously encrypted values
+(clients' LLM/embedding provider keys) can no longer be decrypted. Back it up somewhere safe.
 
 ### 2. Run with Docker Compose
 
 ```bash
 docker compose up --build
 ```
+The API comes up on `http://localhost:8000`; docs at `http://localhost:8000/docs`.
 
-The API comes up on `http://localhost:8000`. Interactive docs:
-`http://localhost:8000/docs`
+For local access to Postgres (e.g. pgAdmin), `docker-compose.override.yml`
+automatically publishes the port (dev only).
 
-### 3. Run locally without Docker
+### 3. Run without Docker
 
 ```bash
 cd cache_api
-pip install -r requirements.txt
+pip install -r requirements.lock.txt
 python main.py
 ```
 
@@ -107,18 +121,17 @@ python main.py
 
 ## Authentication
 
-- **Client-facing endpoints** (`/cache/register`, `/cache/{id}` edit,
-  `/cache/{project_id}` read, `/cache/mine`) are protected by **Casdoor** —
-  either the `cassdoor_token` cookie or an `Authorization: Bearer <token>`
-  header.
-- To test from Swagger: click **Authorize** and paste the JWT (no `Bearer`
-  prefix needed).
-- **`GET /cache`** — the endpoint the gateway calls — is authenticated
-  differently: with the **client's own `cache_key`** (`sc-proj-…`), not a
-  Casdoor token and not an admin key.
-- `verify_gateway_admin_key` (in `auth.py`) is available for any endpoint
-  that should only be callable by an operator/admin, checked against
-  `SC_GATEWAY_ADMIN_KEY`.
+| Type | Mechanism | Used for |
+|---|---|---|
+| End user | Casdoor JWT (`cassdoor_token` cookie or `Authorization: Bearer`) | `register`, `edit`, `/mine`, `/{project_id}` |
+| Project (gateway) | `Authorization: Bearer <cache_key>` | `GET /cache` (the gateway's main endpoint), `proxy/*` |
+| Admin | `Authorization: Bearer <SC_GATEWAY_ADMIN_KEY>` (constant-time compare) | `GET /cache/key/{cache_key}` |
+
+Security notes:
+- If a JWT can't be verified (invalid signature/expired), the request is **rejected** —
+  there is no unsafe fallback.
+- If `SC_GATEWAY_ADMIN_KEY` isn't set in `.env`, the service refuses to start (fail closed).
+- Tokens/keys are never logged.
 
 ---
 
@@ -126,21 +139,19 @@ python main.py
 
 | Method & path | Auth | Purpose |
 |---|---|---|
-| `POST /cache/register` | Casdoor | Register a new cache/project. Mints `project_id` + `cache_key` locally. |
-| `PUT /cache/{cache_id}` | Casdoor | Edit model fields and/or `guard` / `cache_config`. |
-| `GET /cache/{project_id}` | Casdoor | Read one of the caller's own caches. |
-| `GET /cache/mine` | Casdoor | List all of the caller's caches. |
-| `GET /cache` | Bearer `<cache_key>` | **Gateway-facing.** Returns the config contract the gateway expects. |
+| `POST /cache/register` | Casdoor | Register a new project; mints a local `project_id`/`cache_key` |
+| `PUT /cache/{cache_id}` | Casdoor | Edit model fields and/or `guard`/`cache_config` |
+| `GET /cache/mine` | Casdoor | List all of the caller's own projects |
+| `GET /cache/{project_id}` | Casdoor | Read one project (owner only) |
+| `GET /cache/key/{cache_key}` | Admin key | Look up a project by `cache_key` (debug/admin) |
+| `GET /cache` | Bearer `<cache_key>` | **The gateway's main endpoint** — raw `GatewayConfigResponse` shape |
+| `POST /cache/proxy/chat/completions` | Bearer `<cache_key>` | Direct proxy to the project's own `llm_model` |
+| `POST /cache/proxy/embeddings` | Bearer `<cache_key>` | Direct proxy to the project's own `embedd_model` |
 
-All client-facing responses are wrapped:
-
+Regular responses (everything except the flat `GET /cache`) are wrapped:
 ```json
-{ "status_code": 200, "message": "...", "data": { ... } }
+{"status_code": 200, "message": "...", "data": {...}}
 ```
-
-Errors use the same envelope (via a global `HTTPException` handler in
-`main.py`). `GET /cache` (the gateway-facing one) is the exception — it
-returns the raw contract shape, unwrapped, per `APP_INTEGRATION.md`.
 
 ---
 
@@ -163,75 +174,70 @@ returns the raw contract shape, unwrapped, per `APP_INTEGRATION.md`.
   },
   "guard": {
     "enabled": true,
-    "policy": "categories:\n  - category_id: competitor-mentions\n    disallowed_exemplars:\n      - \"...\"\n    allowed_exemplars:\n      - \"...\"\n"
+    "policy": "categories:\n  - category_id: competitor-mentions\n    disallowed_exemplars:\n      - \"...\"\n    allowed_exemplars:\n      - \"...\"\n",
+    "embed_model": "bge-m3",
+    "embed_api_key": "sk-guard-embed-…"
   }
 }
 ```
-
-`cache_config` and `guard` are both optional — see `register_test_samples.md`
-for a full set of copy-pasteable request bodies, including ones that are
-expected to fail validation.
-
-`cache_mode` accepts either a single string (`"bm25"`) or a list
-(`["exact", "bm25", "semantic"]`), per `APP_INTEGRATION.md`.
+`cache_config` and `guard` are both optional. `cache_mode` can be a single string
+or a list. More samples (including error cases) are in `register_test_samples.md`.
 
 ---
 
-## The guard: a three-state switch, not two
+## Guard: a three-state switch, not two
 
 | You send | Result |
 |---|---|
-| no `guard` key, `null`, or `{}` | Off, silently. |
-| `"enabled": false` | Off, plus one warning logged naming the client. |
-| `"enabled": true` + a valid `policy` | On. |
-| a `policy` with **no** `enabled` | `HTTP 502` — refuses to guess. |
-| `"enabled": true` with no usable `policy` | `HTTP 502`. |
+| no `guard` key, `null`, or `{}` | Off, silently |
+| `"enabled": false` | Off, plus a warning logged |
+| `"enabled": true` + valid policy + `embed_model`/`embed_api_key` | On |
+| a `policy` with no `enabled` | `502` — refuses to guess |
+| `"enabled": true` with no usable policy, or missing `embed_model`/`embed_api_key` | `502` |
+| a `mode` that can invoke the judge (`cascade`, `judge-only`, `max`) without `judge_model`/`judge_api_key` | `502` |
 
-Implemented in `app/utils/guard_utils.py::resolve_guard`.
-
-### Policy validation (`validate_policy`)
-
-A guard `policy` is a YAML document. It is rejected (`502`) if it:
-
-- is not valid YAML, or not a mapping
-- has no non-empty `categories` list
-- has a category with a duplicate or missing `category_id`
+Policy validation (`guard_utils.py::validate_policy`) rejects a `policy` if it:
+- isn't valid YAML or has no `categories`
+- has a duplicate or missing `category_id`
 - has a category with no `disallowed_exemplars`
-- has **no `allowed_exemplars` anywhere** (a policy with none would score
-  1.0 for every input)
-- has **every** category set to `action: flag` (use `"enabled": false`
-  instead)
+- has **no** `allowed_exemplars` anywhere in the whole policy
+- has every category set to `action: flag`
 - exceeds 256 KiB or 5000 total exemplars
-- contains YAML anchors/aliases (`&name` / `*name`)
+- contains YAML anchors/aliases (`&`/`*`)
 
-Unknown fields inside `guard` (anything not in the documented set) are
-rejected with `502`, except `x_*`-prefixed keys, which are accepted and
-ignored. Sending `guard.fail_open` specifically returns a `502` pointing to
-`degrade_to_unguarded` instead (per the spec — they are not the same
-setting).
-
-> **Note:** this service only validates policy *structure*. The semantic
-> cross-check described in `APP_INTEGRATION.md` (scoring every exemplar
-> against every other to catch mis-set thresholds) requires calling a real
-> embedding model and is the gateway's responsibility at load time, not
-> this registration service's.
+Unknown fields inside `guard` (other than `x_*`) are rejected with `502`.
 
 ---
 
-## Data model
+## Security — status summary
 
-**`cache`** — one row per registered project: model/embedding credentials,
-`project_id`, `cache_key`, extractor fields.
+### ✅ Fixed
+- Real auth on every management endpoint (no more hardcoded `id_user`)
+- No fallback to unverified JWT decoding (fail closed)
+- Admin-key check with constant-time comparison; fails closed if unconfigured
+- No logging of tokens/keys
+- At-rest encryption of provider credentials (`llm_key`, `embedd_key`, `extaractor_key`) via Fernet
+- Route ordering fixed (static paths registered before `{project_id}`)
+- Atomic registration (rolls back if either insert fails)
+- `unique`/`nullable=False` constraints on `cache_key`/`project_id`
+- Internal errors no longer leak to clients (`str(e)` removed from responses)
+- Basic rate limiting (60 req/min) + request body size limit (1 MB)
+- Postgres no longer published by default
+- Dockerfile: non-root user + `HEALTHCHECK`
+- Hash-locked lockfile (`requirements.lock.txt`) for reproducible builds
+- Alembic scaffolding for controlled schema migrations
+- Security regression tests (`tests/test_security.py`)
 
-**`cacheconfig`** — one-to-one with `cache` (via `cache_id`): `guard_enabled`,
-`guard_policy`, `guard_config` (JSON — everything in `guard` besides
-`enabled`/`policy`), and the cache-mode settings (`cache_mode`, `semantic`,
-`bm25`, `fuzzy`, all stored as JSON columns).
-
-Split into two tables deliberately: the guard/cache settings are nested and
-frequently edited, while the core credentials rarely change — and keeping
-`guard_enabled` as its own boolean column keeps "which projects have guard
-on" queryable without unpacking JSON.
+### ❌ Still outstanding / known limitations
+- **The rate limiter is in-memory** — with multiple replicas, each keeps its own
+  counter (needs Redis for real multi-replica production use)
+- **S04 encryption** covers `Cache`'s direct fields; `guard_config` (JSON,
+  containing judge/embed guard keys) is not yet field-level encrypted
+- **The encryption key** still lives alongside `DATABASE_URL` in the same `.env`
+  — an intermediate step, not a substitute for a real KMS (Vault/AWS KMS)
+- Items belonging to `cache_as_service`/gateway (retention policy, Prometheus
+  metrics, tracing, the Redis registry, API-key lifecycle) are out of scope for
+  this service
 
 ---
 
@@ -239,47 +245,30 @@ on" queryable without unpacking JSON.
 
 ```bash
 cd cache_api
-pip install -r requirements.txt
+pip install -r requirements.lock.txt
 pytest -v
 ```
+With coverage: `pytest --cov=app -v`
 
-Tests run against an **in-memory SQLite** database (no real Postgres
-needed) and mock `get_current_user_id`, so no live Casdoor connection is
-required either. See `tests/conftest.py` for the fixtures and
-`tests/test_cache.py` for coverage of register / edit / read / the
-gateway-facing config endpoint / guard three-state paths.
-
-With coverage:
-
-```bash
-pytest --cov=app -v
-```
+Tests run against an **in-memory SQLite** database (no real Postgres needed)
+and mock `get_current_user_id` — no live Casdoor connection required either.
 
 ---
 
 ## CI
 
-`.github/workflows/ci.yml` runs on every push/PR to `main`/`develop`:
-
-1. Lints with `ruff`
-2. Compiles all Python files (catches basic syntax/import errors early)
-3. Builds the Docker image
-4. Runs the `pytest` suite
-
-Check a run's status under the **Actions** tab of the repo, or on the PR
-itself.
+`.github/workflows/ci.yml`: lint (`ruff`), syntax compile, Docker build, `pytest`.
+Runs on every push/PR to `main`/`develop`.
 
 ---
 
-## Known limitations / things to revisit
+## Migrating to Alembic (before production)
 
-- `id_user` has a foreign key on `User.id`; if the Casdoor user row doesn't
-  exist yet, `create_cache` auto-creates a placeholder `User` row rather
-  than failing — a stopgap until full Casdoor user provisioning is wired
-  in.
-- The database column names `extaractor` / `extaractor_key` intentionally
-  keep the original (misspelled) naming from the initial schema; the
-  API-facing field names match, so no renaming was needed at the boundary.
-- `SC_GATEWAY_ADMIN_KEY`-based auth (`verify_gateway_admin_key`) exists but
-  isn't wired into any endpoint yet — add `Depends(verify_gateway_admin_key)`
-  to any route that should be operator-only.
+```bash
+docker compose exec api bash
+alembic revision --autogenerate -m "initial schema"
+alembic upgrade head
+```
+Then remove `SC_ENVIRONMENT=development` from `.env` and add `alembic upgrade
+head` as a separate deploy step before bringing the service up in your
+deployment pipeline.
