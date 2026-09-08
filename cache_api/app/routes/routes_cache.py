@@ -30,7 +30,7 @@ from ..models.schemas_cache import (
     GatewayConfigResponse,
     CacheModeConfig,
 )
-from ..auth import bearer_scheme, get_current_user_id, verify_gateway_admin_key
+from ..auth import bearer_scheme, get_current_user_id, verify_service_key
 
 logger = logging.getLogger("cache")
 
@@ -248,15 +248,19 @@ def read_all_caches(
 # [S05 FIX] دیگه مقدار خودِ کلید لاگ نمی‌شه
 # مسیر ثابت "/key/..."، قبل از "/{project_id}"
 # ---------------------------------------------------------
-@router.get("/key/{cache_key}", response_model=APIResponse)
+@router.get("/key", response_model=APIResponse)
 def read_cache_by_key(
-    cache_key: str,
     db: Session = Depends(get_session),
-    _admin: str = Depends(verify_gateway_admin_key),
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    _service: str = Depends(verify_service_key),
 ):
-    cache = get_cache_by_key(db=db, cache_key=cache_key)
+    if not credentials:
+        raise HTTPException(status_code=401, detail="not_authenticated")
+ 
+    cache = get_cache_by_key(db=db, cache_key=credentials.credentials)
     if not cache:
         raise HTTPException(status_code=404, detail="Cache not found")
+ 
     config = get_cache_config(db=db, cache_id=cache.id)
     return APIResponse(
         status_code=200,
