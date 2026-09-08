@@ -242,8 +242,18 @@ class GuardPool:
                                             embedder)
         if index is None:
             started = self._clock()
-            matrix = await embedder.embed(list(texts), input_type="document")
-            sentinel = await embedder.embed([SENTINEL_TEXT], input_type="document")
+            # The BUILD budget, not the request's. The embedder handed to us
+            # was built for the request path, whose timeout is a fraction of
+            # one decision deadline; embedding a whole policy is exactly the
+            # slow thing SC_GUARD_BUILD_TIMEOUT exists to allow. The build is
+            # shielded and pool-owned, so nothing is waiting on this call.
+            matrix = await embedder.embed(
+                list(texts), input_type="document", timeout=self._build_timeout
+            )
+            sentinel = await embedder.embed(
+                [SENTINEL_TEXT], input_type="document",
+                timeout=self._build_timeout,
+            )
             index = GuardIndex(
                 matrix=matrix,
                 labels=labels,
@@ -306,7 +316,9 @@ class GuardPool:
         # The identity check TEI's /info was really for: a model repointed
         # behind an unchanged alias at an unchanged URL keeps its name, so only
         # the vectors can reveal it.
-        fresh = await embedder.embed([SENTINEL_TEXT], input_type="document")
+        fresh = await embedder.embed(
+            [SENTINEL_TEXT], input_type="document", timeout=self._build_timeout
+        )
         if not index.verify_sentinel(fresh[0]):
             logger.warning(
                 "Guard index %s failed its sentinel check — the embedding model "

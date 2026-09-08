@@ -16,7 +16,6 @@ from semantic_cache.core.config import (
     SemanticCacheConfig,
 )
 from semantic_cache.core.entity_extractor import (
-    BaseEntityExtractor,
     EntityExtractorFactory,
     LLMEntityExtractor,
 )

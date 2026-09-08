@@ -66,7 +66,7 @@ C4Container
     Rel(user, api, "HTTPS, Bearer JWT / cache key")
     Rel(user, gw, "HTTPS, APP-minted client key (OpenAI SDK compatible)")
     Rel(api, sso, "Trusts tokens issued by")
-    Rel(gw, theapp, "Resolves config by forwarding the caller's key (TTL-cached)")
+    Rel(gw, theapp, "Resolves config: forwards the caller's key + our own service key (TTL-cached)")
     Rel(gw, pg, "Message log, cache backup")
     Rel(gw, mlops, "Cache miss → chat completion (JSON or SSE)")
     Rel(api, pool, "Resolves managers")
@@ -79,28 +79,39 @@ C4Container
 
 Two ways in, usable together:
 
-1. **SSO JWT (preferred).** Clients send `Authorization: Bearer <jwt>`. The
-   token is decoded and the tenant identity is its **organization + username**
-   claims — Casdoor's `owner` + `name` (generic `organization`/`user_id`/`sub`
-   aliases are also accepted) — so the same person always maps to the same
-   tenant and caches.
-   Tenants **auto-provision on first login** — no admin step. (The signature
-   is not verified in-process; put this behind a gateway that validates the
-   token, or add verification in `saas/jwt_auth.py`.)
+1. **SSO JWT.** Clients send `Authorization: Bearer <jwt>`. The token's
+   **signature is verified** against your SSO's key, then the tenant identity
+   is its **organization + username** claims — Casdoor's `owner` + `name`
+   (generic `organization`/`user_id`/`sub` aliases are also accepted) — so the
+   same person always maps to the same tenant and caches.
+   Tenants **auto-provision on first login**, which is exactly why the token is
+   verified: an unverified payload is not a login, it is a tenant-creation
+   endpoint open to anyone. Configure it with [`SC_SSO_*`](#sso-jwts-sc_sso_);
+   with none of those set the JWT path is **closed**, not open.
 2. **Per-cache API keys** (`sc-...`). A tenant mints a key scoped to **one**
-   cache for machine-to-machine data access; keys are rotatable and revoked
-   when the cache is deleted.
+   cache for machine-to-machine data access. Keys carry an id, a display
+   prefix, an optional expiry and a last-used timestamp, so one can be listed,
+   audited and revoked individually; rotation takes a grace period so callers
+   can redeploy before the old key stops working. All keys for a cache are
+   revoked when the cache is deleted. Only a **peppered fingerprint** is
+   stored — see `SC_API_KEY_PEPPER`.
 
 ### Endpoints
 
 | Method & path | Auth | Purpose |
 |---|---|---|
-| `GET /health` | none | Liveness/readiness (checks Redis). |
+| `GET /health` | none | **Liveness** — the process is up. Checks nothing external, so a Redis blip cannot restart-loop the container. |
+| `GET /ready` | none | **Readiness** — every dependency the enabled serving mode needs (Redis, Postgres, the APP config endpoint), each probe bounded. 503 + a per-dependency breakdown when one is down. |
+| `GET /metrics` | admin key | Prometheus exposition. 503 when `SC_ADMIN_API_KEY` is unset — never open. |
 | `GET /v1/me` | JWT / tenant key | Tenant id + cache count + every cache. |
 | `POST /v1/caches` | JWT / tenant key | Create a named cache (optional per-cache `config`). |
 | `GET /v1/caches` · `GET/PATCH/DELETE /v1/caches/{id}` | JWT / tenant key | List / get / update settings / delete. |
-| `POST /v1/caches/{id}/keys` · `.../keys/rotate` | JWT / tenant key | Issue / rotate a per-cache key. |
-| `POST /v1/tenant/rotate-key` | tenant key | Rotate the account key. |
+| `POST /v1/caches/{id}/keys` | JWT / tenant key | Issue a per-cache key. `?expires_in=<seconds>` for one that expires. |
+| `GET /v1/caches/{id}/keys` | JWT / tenant key | List that cache's live keys by `key_id` + prefix. **No key material, no fingerprints.** |
+| `POST /v1/caches/{id}/keys/rotate` | JWT / tenant key | Rotate. `?grace=<seconds>` keeps the old keys alive while callers redeploy. |
+| `DELETE /v1/caches/{id}/keys/{key_id}` | JWT / tenant key | Revoke **one** key, leaving the others working. |
+| `GET /v1/tenant/keys` · `DELETE /v1/tenant/keys/{key_id}` | tenant key | List / selectively revoke account keys. |
+| `POST /v1/tenant/rotate-key` | tenant key | Rotate the account key. `?grace=<seconds>` as above. |
 | `POST /v1/caches/{id}/search` · `.../set` · `DELETE .../entries` | JWT / tenant / cache key | Cache data plane. |
 | `POST /v1/tenants` | admin key | Legacy: create tenant (only if `SC_ADMIN_API_KEY` set). |
 
@@ -108,20 +119,57 @@ Per-cache overrides accepted in `config`: `similarity_threshold`,
 `entity_threshold`, `default_ttl`, `permanent_hit_threshold`, `exact_tier`,
 `normalize_aggressive`, `fail_open`.
 
+#### SSO JWTs (`SC_SSO_*`)
+
+A verified JWT **auto-provisions a tenant** — the identity is `owner|name`
+(Casdoor's fields; `organization`/`sub` and friends are accepted as aliases).
+That makes these settings a tenant-creation control, not just a login one, so
+the JWT path **fails closed**: with none of them set, JWT bearers are rejected
+outright and only minted `sc-...` keys authenticate. The server logs a warning
+at boot when it comes up in that state.
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `SC_SSO_JWKS_URL` | for RS/ES/PS/Ed | The SSO's JWKS endpoint. Needs `pip install '.[sso]'` (PyJWT). |
+| `SC_SSO_SHARED_SECRET` | for HS256/384/512 | Shared secret. Verified in-process with stdlib `hmac` — no extra needed. |
+| `SC_SSO_ALGORITHMS` | no (`["RS256"]`) | Allowlist of accepted `alg` values. Enforced **before** a key is chosen, so alg-confusion and `alg: none` are unreachable. Naming an algorithm you have no key for is a **fatal** startup error, not a silent reject. |
+| `SC_SSO_ISSUER` | no | Expected `iss`. Unset → unchecked, safe only if the signing key is single-purpose. |
+| `SC_SSO_AUDIENCE` | no | Expected `aud`. **Set this whenever your SSO serves more than this service** — otherwise a token minted for another app is accepted here. |
+| `SC_SSO_LEEWAY` | no (`60`) | Clock-skew tolerance in seconds for `exp`/`nbf`. |
+| `SC_SSO_JWKS_TTL` | no (`300`) | Seconds to cache the JWKS before refetching. |
+
+Tokens with no `exp` are refused: a bearer credential that never expires is not
+one this service will hold.
+
 ### Deploy
 
 ```bash
-# Whole stack (API + Redis Stack + Postgres), built locally:
+# Local dev — base + docker-compose.override.yml, which publishes Redis and
+# Postgres to your host so you can point redis-cli and psql at them:
 docker compose up -d --build
-curl localhost:8080/health            # {"status":"ok","redis":true}
+curl localhost:8080/health            # {"status":"ok"}          liveness
+curl localhost:8080/ready             # per-dependency breakdown  readiness
+
+# Production — the BASE FILE ALONE. The data stores stay on the compose
+# network, unpublished:
+docker compose -f docker-compose.yml up -d
 
 # Or run the service against an existing Redis:
 docker build -t semantic-cache-saas .
 docker run -p 8080:8080 -e SC_REDIS_HOST=my-redis semantic-cache-saas
 ```
 
-Copy `.env.example` to `.env` first — see
-[the gateway's environment table](#environment) for what the gateway needs.
+Copy `.env.example` to `.env` first. **Three variables have no default and
+compose will refuse to start without them** — `REDIS_PASSWORD`,
+`POSTGRES_PASSWORD` and `SC_API_KEY_PEPPER`. That is deliberate: the previous
+`scuser`/`scpass` was a real credential printed in this repository, on a
+published port. `.env.example` has the one-liners to generate them.
+
+`SC_API_KEY_PEPPER` must not change once you have live keys — every stored key
+fingerprint is computed under it, so rotating it logs every tenant out. Back it
+up with your other secrets.
+
+See [the gateway's environment table](#environment) for what the gateway needs.
 Behind a proxy, pass it into the build:
 `docker compose build --build-arg HTTPS_PROXY=http://host.docker.internal:PORT`.
 
@@ -192,7 +240,10 @@ input guard that checks the client's messages against a policy the APP supplies
 and can refuse the request before it reaches the cache or the model. Absent it,
 nothing changes. Unlike the cache it **fails closed** — if it cannot run, the
 request is refused rather than served unchecked, unless that client opted into
-`degrade_to_unguarded`. Full contract: `Docs/APP_INTEGRATION.md` §2b.
+`degrade_to_unguarded`. Full contract for the APP: `Docs/APP_INTEGRATION.md`
+§2b. **Picking this work up? Start at `Docs/GUARD_HANDOFF.md`** — state, how to
+run the smoke and the detection eval, the invariants that must not be undone,
+and the open items.
 
 **Postgres stores**: a log row per served message, and a **durable backup of
 every cache entry** (including its embedding vector) — no keys, no configs.
@@ -240,8 +291,8 @@ a bare 404).
 | `SC_EMBED_BASE_URL` | yes | MLOps embeddings endpoint for the cache. |
 | `SC_EXTRACTOR_BASE_URL` | no | Entity-extractor endpoint; only used when the APP returns an extractor model. |
 | `SC_GUARD_ENABLED` | no | Operator break-glass for the input guard (default `true`). Also flippable at runtime via `POST /admin/guard`. |
-| `SC_GUARD_TIMEOUT` | no | Whole-check deadline for one guard decision, seconds (default `5.0`). Deliberately not the 120s upstream timeout. |
-| `SC_GUARD_BUILD_TIMEOUT` | no | Deadline for embedding a policy's exemplars (default `60.0`). |
+| `SC_GUARD_TIMEOUT` | no | Whole-check deadline for one guard decision, seconds (default `5.0`). Deliberately not the 120s upstream timeout. **Raise this if your embedding endpoint is slow on the request path** — the per-stage HTTP timeouts are derived from it (an `embedding-only` client's embed call gets ~90% of it, since no judge has to run after it). |
+| `SC_GUARD_BUILD_TIMEOUT` | no | Deadline for embedding a policy's exemplars (default `60.0`). Governs the build's own embedding calls, which are **not** limited by `SC_GUARD_TIMEOUT`: the build is server-owned and shielded, so a slow first build costs one refused request, not a permanent failure. |
 | `SC_GUARD_MAX_EXEMPLARS` | no | Cap on exemplars in one policy (default `5000`). |
 | `SC_GUARD_MAX_POLICY_BYTES` | no | Cap on the inline policy YAML (default `262144`). |
 | `SC_GUARD_CACHE_MAX_BYTES` | no | Byte budget for in-process exemplar matrices (default 256 MiB). |
@@ -267,7 +318,7 @@ with a `.env` like:
 
 ```bash
 APP_PORT=8080
-SC_PG_DSN=postgresql://scuser:scpass@postgres:5432/sccache
+SC_PG_DSN=postgresql://scuser:${POSTGRES_PASSWORD}@postgres:5432/sccache
 SC_APP_CONFIG_URL=https://app.example.com/api/gateway-config
 SC_LLM_BASE_URL=https://mlops.example.com
 SC_EMBED_BASE_URL=https://mlops.example.com

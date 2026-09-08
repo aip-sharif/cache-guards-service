@@ -2,7 +2,6 @@
 
 import json
 
-import pytest
 
 from semantic_cache.gateway.chat import (
     SSEAccumulator,

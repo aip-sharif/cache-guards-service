@@ -1,6 +1,5 @@
 """Tests for the optional translation layer in TextNormalizer."""
 
-import importlib
 
 import pytest
 

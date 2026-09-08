@@ -24,7 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
 from semantic_cache.gateway.guard_config import GuardConfigError, ResolvedGuard
 from semantic_cache.gateway.guard_judge import (
@@ -50,7 +50,6 @@ from semantic_cache.gateway.guard_pool import (
 )
 from semantic_cache.gateway.guard_vectors import (
     GuardDimMismatch,
-    GuardEmbedder,
     GuardEmbedError,
 )
 

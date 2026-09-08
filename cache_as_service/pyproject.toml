@@ -56,6 +56,10 @@ async = ["httpx>=0.25"]
 sentry = ["sentry-sdk[fastapi]>=2.0"]
 # OpenAI-compatible gateway: Postgres registry/keys/message-log.
 postgres = ["psycopg[binary,pool]>=3.1"]
+# SSO JWT verification against a JWKS endpoint (RS*/ES*/PS*/Ed*). HS256/384/512
+# needs nothing — jwt_auth verifies those with stdlib hmac — so this extra is
+# required only when SC_SSO_JWKS_URL is set.
+sso = ["PyJWT[crypto]>=2.8"]
 # Dev / test.
 dev = [
     "pytest>=7",
@@ -74,6 +78,7 @@ all = [
     "httpx>=0.25",
     "sentry-sdk[fastapi]>=2.0",
     "psycopg[binary,pool]>=3.1",
+    "PyJWT[crypto]>=2.8",
 ]
 
 [project.urls]
@@ -101,3 +106,24 @@ semantic_cache = ["py.typed"]
 [tool.pytest.ini_options]
 testpaths = ["tests/unit"]
 asyncio_mode = "auto"
+
+# Lint. CI runs this WITHOUT --exit-zero, so anything listed here fails a build.
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+# E501 (line too long) is OFF, and deliberately so. This codebase predates any
+# line-length rule and has ~15 violations spread across entity_extractor,
+# config and the langchain adapter. Turning it on now means a mass reflow in
+# the same commit as security fixes, which is exactly how a real change gets
+# lost in a diff. Turn it on in its own commit.
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# E741 (ambiguous name "l"): a handful of pre-existing SSE-parsing
+# comprehensions in the gateway tests use `l` for "line". Renaming them is
+# churn in tests that are not otherwise being touched; the rule stays ON for
+# semantic_cache/ where it matters.
+"tests/*" = ["E741"]

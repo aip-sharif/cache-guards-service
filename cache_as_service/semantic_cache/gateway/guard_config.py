@@ -31,7 +31,7 @@ import hashlib
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator

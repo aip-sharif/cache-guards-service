@@ -21,19 +21,11 @@ services:
     ports:
       - "${APP_PORT:-8080}:8080"
     environment:
-      # HTTP_PROXY: "http://host.docker.internal:10809"
-      # HTTPS_PROXY: "http://host.docker.internal:10809"
-      # http_proxy: "http://host.docker.internal:10809"
-      # https_proxy: "http://host.docker.internal:10809"
-
-      # # استثنا کردن دات‌نت و دیتابیس‌های داخلی کانتینر
-      # NO_PROXY: "localhost,127.0.0.1,redis,postgres,semantic-cache-redis,semantic-cache-postgres,api,db,app-config,172.16.0.0/12,192.168.0.0/16,10.0.0.0/8,.local,shared_net"
-      # no_proxy: "localhost,127.0.0.1,redis,postgres,semantic-cache-redis,semantic-cache-postgres,api,db,app-config,172.16.0.0/12,192.168.0.0/16,10.0.0.0/8,.local,shared_net"
-
       SC_REDIS_HOST: redis
       # Read the Redis port from the environment (see .env / REDIS_PORT),
       # defaulting to 6379. Must match what the redis service binds below.
       SC_REDIS_PORT: "${REDIS_PORT:-6379}"
+      SC_REDIS_PASSWORD: "${REDIS_PASSWORD:?set REDIS_PASSWORD — an unauthenticated Redis holds every tenant's cached completions}"
       SC_EXACT_TIER: "true"
       # Embeddings are API-based (OpenRouter / mlops / any OpenAI-compatible
       # endpoint) — no local model in the image. This shared embedder serves
@@ -47,16 +39,16 @@ services:
       SC_ENVIRONMENT: "${SC_ENVIRONMENT:-production}"
       # Error reporting (optional). Set SC_SENTRY_DSN in your .env to enable.
       SC_SENTRY_DSN: "${SC_SENTRY_DSN:-}"
+      SC_SENTRY_TRACES_SAMPLE_RATE: "${SC_SENTRY_TRACES_SAMPLE_RATE:-0.0}"
       # OpenAI-compatible gateway (optional). Mounts /v1/chat/completions when
       # ALL FOUR are set: an existing Postgres, the APP's config endpoint, and
       # the mlops chat + embedding endpoints. The APP mints and validates the
       # client keys — this service never does, so there is no admin/mint token
       # for the gateway.
       SC_PG_DSN: "${SC_PG_DSN:-}"
-      # The `app` service below (aliased `app-config` on shared_net) is this
-      # APP. Point this at its config route, e.g. http://app-config:8000/config
       SC_APP_CONFIG_URL: "${SC_APP_CONFIG_URL:-}"
       SC_APP_CONFIG_TTL: "${SC_APP_CONFIG_TTL:-60}"
+      SC_APP_CONFIG_MAX_ENTRIES: "${SC_APP_CONFIG_MAX_ENTRIES:-10000}"
       SC_LLM_BASE_URL: "${SC_LLM_BASE_URL:-}"
       SC_EMBED_BASE_URL: "${SC_EMBED_BASE_URL:-}"
       SC_EXTRACTOR_BASE_URL: "${SC_EXTRACTOR_BASE_URL:-}"
@@ -76,60 +68,83 @@ services:
       # Both fall back to SC_EMBED_BASE_URL / SC_LLM_BASE_URL when unset.
       SC_GUARD_EMBED_BASE_URL: "${SC_GUARD_EMBED_BASE_URL:-}"
       SC_GUARD_JUDGE_BASE_URL: "${SC_GUARD_JUDGE_BASE_URL:-}"
-      # Bearer for the SaaS multi-tenant admin routes (tenant creation) only —
-      # NOT used by the OpenAI gateway. Unset → SaaS admin disabled.
+      # Bearer for the SaaS multi-tenant admin routes (tenant creation) and
+      # for scraping /metrics — NOT used by the OpenAI gateway. Unset → SaaS
+      # admin disabled and /metrics answers 503.
       SC_ADMIN_API_KEY: "${SC_ADMIN_API_KEY:-}"
+      # Pepper for API-key lookup fingerprints. Without it a stolen Redis
+      # snapshot lets an attacker confirm a guessed key offline. Existing keys
+      # migrate to the peppered fingerprint the next time they are used.
+      SC_API_KEY_PEPPER: "${SC_API_KEY_PEPPER:?set SC_API_KEY_PEPPER to a long random string — see README}"
+      # SSO. Unset → JWT bearers are REJECTED and only minted sc-... keys work.
+      SC_SSO_JWKS_URL: "${SC_SSO_JWKS_URL:-}"
+      SC_SSO_SHARED_SECRET: "${SC_SSO_SHARED_SECRET:-}"
+      SC_SSO_ISSUER: "${SC_SSO_ISSUER:-}"
+      SC_SSO_AUDIENCE: "${SC_SSO_AUDIENCE:-}"
+      SC_MAX_REQUEST_BYTES: "${SC_MAX_REQUEST_BYTES:-1048576}"
     depends_on:
       redis:
         condition: service_healthy
       postgres:
         condition: service_healthy
-      # Not required to start (no healthcheck defined on `app`), but the
-      # gateway's config polling needs it up sooner rather than later.
-      app:
-        condition: service_started
+    # /health is LIVENESS: it checks nothing external, so a Redis blip cannot
+    # turn `restart: unless-stopped` into a restart loop. Dependency state is
+    # at /ready, for your orchestrator's readiness probe.
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health').status==200 else 1)"]
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health', timeout=4).status==200 else 1)"]
       interval: 15s
       timeout: 5s
       retries: 5
       start_period: 40s
     restart: unless-stopped
-    # extra_hosts:
-    #   - "host.docker.internal:host-gateway"
+    # One uvicorn worker by design (see Dockerfile) — the guard matrices, the
+    # segment memo and the APP-config cache are all per-process. Size for one
+    # process and scale with replicas.
+    deploy:
+      resources:
+        limits:
+          cpus: "${API_CPUS:-2}"
+          memory: ${API_MEMORY:-2g}
+    security_opt:
+      - no-new-privileges:true
     networks:
       - shared_net
 
   redis:
-    image: redis/redis-stack-server:latest
+    # Pinned by digest. `latest` meant the datastore under a multi-tenant cache
+    # could change major version between two `docker compose up` runs.
+    image: redis/redis-stack-server:7.4.0-v5@sha256:bf3ee511b24c952341d357039e2d706617fa9f34f633696d0b1fef42df02f375
     container_name: semantic-cache-redis
-    # Redis binds AND publishes on ${REDIS_PORT} (default 6379). One variable
-    # drives the container port, the published port, and the healthcheck.
-    ports:
-      - "${REDIS_PORT:-6379}:${REDIS_PORT:-6379}"
+    # NOT published. Reachable only on the compose network. The override file
+    # publishes it for local work.
+    expose:
+      - "${REDIS_PORT:-6379}"
     volumes:
       - redis_data:/data
-    # High Standard Persistence Configuration:
-    # --appendonly yes: Enables AOF (Append Only File) to log every write operation.
-    # --save 60 1: Saves an RDB snapshot if at least 1 key changed in 60 seconds (useful for backups).
-    # --protected-mode no: with a custom command the redis-stack defaults are
-    # bypassed and protected mode comes back ON, which rejects the app
-    # container's connection (it is not loopback). Safe here: Redis is only
-    # reachable on the compose network + the published port you choose.
+    # --requirepass replaces `--protected-mode no`. Protected mode was disabled
+    # because it refuses non-loopback clients on an unauthenticated instance —
+    # the fix for that is a password, not turning the guard off. With
+    # requirepass set, protected mode accepts the app container and still
+    # refuses anonymous connections.
+    #
+    # --appendonly yes: AOF, every write logged.
+    # --save 60 1: RDB snapshot if >=1 key changed in 60s (backups).
     command: >
       redis-server
       --port ${REDIS_PORT:-6379}
+      --requirepass ${REDIS_PASSWORD:?set REDIS_PASSWORD}
       --loadmodule /opt/redis-stack/lib/redisearch.so
       --loadmodule /opt/redis-stack/lib/rejson.so
       --appendonly yes
       --save 60 1
-      --protected-mode no
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "redis-cli", "-p", "${REDIS_PORT:-6379}", "ping"]
+      test: ["CMD", "redis-cli", "-p", "${REDIS_PORT:-6379}", "-a", "${REDIS_PASSWORD}", "--no-auth-warning", "ping"]
       interval: 10s
       timeout: 5s
       retries: 3
+    security_opt:
+      - no-new-privileges:true
     networks:
       - shared_net
 
@@ -142,14 +157,17 @@ services:
   # In PRODUCTION, point SC_PG_DSN at your OWN Postgres and remove this
   # service (or don't publish PG_PORT).
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
     container_name: semantic-cache-postgres
     environment:
       POSTGRES_USER: scuser
-      POSTGRES_PASSWORD: scpass
+      # No default. The old `scpass` was a published credential on a published
+      # port; Compose now refuses to start rather than reuse it.
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD — it is the password for every tenant's message log}"
       POSTGRES_DB: sccache
-    ports:
-      - "${PG_PORT:-5432}:5432"
+    # NOT published. The override file publishes it for local work.
+    expose:
+      - "5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
     restart: unless-stopped
@@ -158,6 +176,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
+    security_opt:
+      - no-new-privileges:true
     networks:
       - shared_net
 

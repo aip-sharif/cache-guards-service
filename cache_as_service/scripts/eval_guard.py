@@ -47,7 +47,8 @@ class LocalEmbedder:
         self._model = SentenceTransformer(model_name)
         self.call_count = 0
 
-    async def embed(self, texts: Sequence[str], *, input_type: str = "document"):
+    async def embed(self, texts: Sequence[str], *, input_type: str = "document",
+                    timeout: float = None):
         self.call_count += 1
         vectors = self._model.encode(list(texts), normalize_embeddings=True)
         return np.ascontiguousarray(np.asarray(vectors), dtype=np.float32)

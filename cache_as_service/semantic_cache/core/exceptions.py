@@ -18,9 +18,9 @@ class RedisConnectionError(SemanticCacheError):
 
 class EmbeddingGenerationError(SemanticCacheError):
     """Raised when generating embeddings fails.
-    
-    This can occur either due to local HuggingFace issues or 
-    errors with third-party API endpoints, such as timeouts or 
+
+    This can occur either due to local HuggingFace issues or
+    errors with third-party API endpoints, such as timeouts or
     invalid API keys.
     """
     pass

@@ -38,9 +38,11 @@ class AppSpy:
         return httpx.Response(self.status, json=self.body)
 
 
-def _client(spy, ttl=60.0, url=APP_URL):
+def _client(spy, ttl=60.0, url=APP_URL, max_entries=10_000, **kw):
     http = httpx.AsyncClient(transport=httpx.MockTransport(spy))
-    return AppConfigClient(http, url=url, ttl=ttl)
+    return AppConfigClient(
+        http, url=url, ttl=ttl, max_entries=max_entries, **kw
+    )
 
 
 @pytest.mark.asyncio
@@ -180,3 +182,155 @@ async def test_errors_are_not_cached() -> None:
     spy.status = 200                        # APP recovers
     config = await client.resolve("k")
     assert config["model"] == "gpt-x"
+
+
+# --------------------------------------------------------------------------- #
+# The cache is BOUNDED and keyed by a fingerprint
+#
+# It is keyed by the caller's own key, so an unbounded dict is sized by our
+# callers rather than by us — every wrong bearer included — and each entry
+# holds live provider credentials.
+# --------------------------------------------------------------------------- #
+
+
+async def test_the_cache_is_bounded() -> None:
+    spy = AppSpy()
+    client = _client(spy, max_entries=3)
+    for i in range(50):
+        await client.resolve(f"key-{i}")
+    assert len(client) == 3
+
+
+async def test_eviction_is_least_recently_used_not_oldest_first() -> None:
+    """A burst of unknown keys must not flush the working set: the live key
+    keeps being used, so it must be the one that survives."""
+    spy = AppSpy()
+    client = _client(spy, max_entries=3)
+
+    await client.resolve("live-key")
+    for i in range(10):
+        await client.resolve(f"noise-{i}")
+        await client.resolve("live-key")  # keeps it recent
+
+    before = len(spy.requests)
+    await client.resolve("live-key")
+    assert len(spy.requests) == before, "the live key was evicted and refetched"
+
+
+async def test_the_raw_key_is_never_a_cache_key() -> None:
+    """A heap dump of this dict must not hand over the bearer tokens."""
+    spy = AppSpy()
+    client = _client(spy)
+    await client.resolve("sk-super-secret-key")
+    assert "sk-super-secret-key" not in client._cache
+
+
+async def test_invalidate_drops_the_fingerprinted_entry() -> None:
+    """Rotation and revocation have to take effect now, not in up to a TTL."""
+    spy = AppSpy()
+    client = _client(spy)
+    await client.resolve("k")
+    await client.resolve("k")
+    assert len(spy.requests) == 1
+
+    client.invalidate("k")
+    await client.resolve("k")
+    assert len(spy.requests) == 2
+
+
+async def test_invalidate_all_clears_everything() -> None:
+    spy = AppSpy()
+    client = _client(spy)
+    await client.resolve("a")
+    await client.resolve("b")
+    client.invalidate()
+    assert len(client) == 0
+
+
+async def test_an_expired_entry_is_dropped_not_merely_ignored() -> None:
+    """Expired credentials should leave memory when they expire, rather than
+    linger until something else needs the space."""
+    spy = AppSpy()
+    client = _client(spy, ttl=0.0)
+    await client.resolve("k")
+    await client.resolve("k")
+    assert len(client) == 1
+    assert len(spy.requests) == 2
+
+
+# --------------------------------------------------------------------------- #
+# The SERVICE credential
+#
+# Two credentials answering two different questions: the bearer says WHICH
+# CLIENT this config is for, the service key says IT IS THE CACHE SERVICE
+# asking. Without the second, a leaked client key is enough to pull that
+# client's model-provider credentials straight out of the APP.
+# --------------------------------------------------------------------------- #
+
+SERVICE_KEY = "svc-shared-between-app-and-us"
+
+
+async def test_the_service_key_is_sent_in_its_own_header() -> None:
+    spy = AppSpy()
+    client = _client(spy, service_key=SERVICE_KEY)
+    await client.resolve("sc-proj-client")
+
+    (request,) = spy.requests
+    assert request.headers["X-Service-Key"] == SERVICE_KEY
+    # And NOT collapsed into Authorization, which carries the client's key.
+    assert request.headers["Authorization"] == "Bearer sc-proj-client"
+
+
+async def test_the_header_name_is_configurable() -> None:
+    """So the APP team can choose it without a code change here."""
+    spy = AppSpy()
+    client = _client(
+        spy, service_key=SERVICE_KEY, service_key_header="X-Cache-Service-Token"
+    )
+    await client.resolve("sc-proj-client")
+
+    (request,) = spy.requests
+    assert request.headers["X-Cache-Service-Token"] == SERVICE_KEY
+    assert "x-service-key" not in request.headers
+
+
+async def test_no_service_key_sends_no_header() -> None:
+    """Unset must leave the contract exactly as it was, so the two sides can be
+    deployed in either order rather than in lockstep."""
+    spy = AppSpy()
+    client = _client(spy)
+    await client.resolve("sc-proj-client")
+
+    (request,) = spy.requests
+    assert "x-service-key" not in request.headers
+    assert client.authenticates_as_a_service is False
+
+
+async def test_the_client_reports_whether_it_authenticates_as_a_service() -> None:
+    """create_app logs a warning on False — an operator should not have to read
+    a header dump to find out they are unauthenticated to the APP."""
+    assert _client(AppSpy(), service_key=SERVICE_KEY).authenticates_as_a_service
+    assert not _client(AppSpy(), service_key="").authenticates_as_a_service
+    assert not _client(AppSpy(), service_key=None).authenticates_as_a_service
+
+
+async def test_the_service_key_is_sent_on_every_uncached_call() -> None:
+    """It is not a handshake — there is no session, so every request carries
+    it. A cached config makes no request at all."""
+    spy = AppSpy()
+    client = _client(spy, service_key=SERVICE_KEY)
+    await client.resolve("key-a")
+    await client.resolve("key-b")
+    await client.resolve("key-a")  # cached: no third request
+
+    assert len(spy.requests) == 2
+    assert all(r.headers["X-Service-Key"] == SERVICE_KEY for r in spy.requests)
+
+
+async def test_an_empty_header_name_falls_back_to_the_default() -> None:
+    """A blank SC_APP_SERVICE_KEY_HEADER must not produce a header with no
+    name, which httpx would reject at request time."""
+    spy = AppSpy()
+    client = _client(spy, service_key=SERVICE_KEY, service_key_header="")
+    await client.resolve("sc-proj-client")
+    assert spy.requests[0].headers["X-Service-Key"] == SERVICE_KEY

@@ -4,7 +4,6 @@ Reuses the fakes from test_gateway_router_unit so the un-guarded and guarded
 paths are exercised through the same seams.
 """
 
-import json
 from typing import Any, Dict, List, Optional
 
 import httpx

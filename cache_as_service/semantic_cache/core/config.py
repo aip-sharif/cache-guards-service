@@ -119,7 +119,7 @@ class FuzzyParams(BaseModel):
 class SemanticCacheConfig(BaseSettings):
     """Configuration for the Semantic Caching system.
 
-    Loads from environment variables by default. All environment variables 
+    Loads from environment variables by default. All environment variables
     can be prefixed with `SC_` (e.g., SC_REDIS_HOST).
     """
 
@@ -174,6 +174,89 @@ class SemanticCacheConfig(BaseSettings):
         ),
     )
 
+    api_key_pepper: Optional[SecretStr] = Field(
+        default=None,
+        description=(
+            "Server-side pepper for API-key lookup fingerprints "
+            "(SC_API_KEY_PEPPER). Without it keys are stored as a bare sha256, "
+            "which anyone who can read the Redis keyspace — a backup, a "
+            "snapshot, a support dump — can check a guess against offline. "
+            "Set it to a long random string and keep it OUT of the data store. "
+            "Existing keys keep working: they migrate to the peppered "
+            "fingerprint the next time they are used."
+        ),
+    )
+
+    max_request_bytes: int = Field(
+        default=1_048_576,
+        description=(
+            "Ceiling on a request body in bytes (SC_MAX_REQUEST_BYTES, default "
+            "1 MiB); 0 disables. Enforced on the STREAM, not just on "
+            "Content-Length. Raise it if your clients legitimately send long "
+            "conversations - a 1 MiB chat body is roughly 250k tokens."
+        ),
+    )
+
+    readiness_timeout: float = Field(
+        default=2.0,
+        description=(
+            "Per-dependency deadline for GET /ready, seconds "
+            "(SC_READINESS_TIMEOUT). Keep it well under the probe interval: a "
+            "readiness check that outlives its own scrape stops being a signal."
+        ),
+    )
+
+    # SSO JWT verification. A verified JWT AUTO-PROVISIONS a tenant, so these
+    # settings are the difference between "our SSO can sign people in" and
+    # "anyone can mint a tenant". All default to unset, which DISABLES the JWT
+    # path entirely and leaves only minted sc-... keys — fail closed.
+    sso_jwks_url: Optional[str] = Field(
+        default=None,
+        description=(
+            "JWKS endpoint of the SSO that signs user tokens (SC_SSO_JWKS_URL, "
+            "e.g. https://sso.example.com/.well-known/jwks.json). Required for "
+            "RS*/ES*/PS* tokens; needs the [sso] extra (PyJWT)."
+        ),
+    )
+    sso_shared_secret: Optional[SecretStr] = Field(
+        default=None,
+        description=(
+            "Shared secret for HS256/384/512 SSO tokens (SC_SSO_SHARED_SECRET). "
+            "Verified in-process with stdlib hmac — no extra needed."
+        ),
+    )
+    sso_issuer: Optional[str] = Field(
+        default=None,
+        description=(
+            "Expected 'iss' claim (SC_SSO_ISSUER). Unset → issuer is not "
+            "checked, which is safe only when the signing key is single-purpose."
+        ),
+    )
+    sso_audience: Optional[str] = Field(
+        default=None,
+        description=(
+            "Expected 'aud' claim (SC_SSO_AUDIENCE). Unset → audience is not "
+            "checked, so a token minted for a DIFFERENT service by the same SSO "
+            "is accepted here. Set it whenever the SSO serves more than us."
+        ),
+    )
+    sso_algorithms: List[str] = Field(
+        default_factory=lambda: ["RS256"],
+        description=(
+            "Allowlist of accepted 'alg' values (SC_SSO_ALGORITHMS, "
+            'e.g. \'["RS256"]\'). Enforced before a key is chosen, so '
+            "alg-confusion and alg=none are unreachable."
+        ),
+    )
+    sso_leeway: float = Field(
+        default=60.0,
+        description="Clock-skew tolerance in seconds for exp/nbf (SC_SSO_LEEWAY).",
+    )
+    sso_jwks_ttl: float = Field(
+        default=300.0,
+        description="Seconds to cache the SSO's JWKS before refetching (SC_SSO_JWKS_TTL).",
+    )
+
     # OpenAI-compatible gateway (semantic_cache.gateway)
     pg_dsn: Optional[SecretStr] = Field(
         default=None,
@@ -204,6 +287,35 @@ class SemanticCacheConfig(BaseSettings):
         description=(
             "Seconds a key's config fetched from the APP is cached in memory "
             "before being re-fetched (SC_APP_CONFIG_TTL)."
+        ),
+    )
+    app_service_key: Optional[SecretStr] = Field(
+        default=None,
+        description=(
+            "Shared secret proving to the APP that the caller is THIS SERVICE "
+            "(SC_APP_SERVICE_KEY). Distinct from the client key: the bearer we "
+            "forward says which client, this says it is us asking. Without it "
+            "the APP's config endpoint is guarded by the client key alone, so "
+            "anyone holding a client key can pull that client's model-provider "
+            "credentials straight from the APP. Unset -> not sent, and the "
+            "contract is unchanged."
+        ),
+    )
+    app_service_key_header: str = Field(
+        default="X-Service-Key",
+        description=(
+            "Header the service key travels in (SC_APP_SERVICE_KEY_HEADER). "
+            "Configurable so the APP team can choose the name without a code "
+            "change here. Never Authorization - that carries the client key."
+        ),
+    )
+    app_config_max_entries: int = Field(
+        default=10_000,
+        description=(
+            "Ceiling on cached per-key configs (SC_APP_CONFIG_MAX_ENTRIES). The "
+            "cache is keyed by the CALLER's key, so without a bound its size is "
+            "chosen by our callers — every wrong bearer included — and each "
+            "entry holds live provider credentials. LRU eviction beyond this."
         ),
     )
     llm_base_url: Optional[str] = Field(
@@ -424,7 +536,7 @@ class SemanticCacheConfig(BaseSettings):
         ),
     )
     translation_target_language: str = Field(
-        default="en", 
+        default="en",
         description="The canonical language code to translate into if enable_translation is True."
     )
 

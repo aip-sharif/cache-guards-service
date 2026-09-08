@@ -3,17 +3,13 @@
 import asyncio
 import hashlib
 
-import numpy as np
-import pytest
 
 from semantic_cache.gateway.guard_checker import REASONS, GuardChecker, GuardOutcome
-from semantic_cache.gateway.guard_judge import GuardJudge, GuardJudgeError, JudgeVerdict
+from semantic_cache.gateway.guard_judge import GuardJudgeError, JudgeVerdict
 from semantic_cache.gateway.guard_logic import Segment
 from semantic_cache.gateway.guard_pool import GuardPool
-from semantic_cache.gateway.guard_vectors import GuardEmbedError
 
 from tests.unit.test_guard_pool_unit import (  # reuse the doubles
-    DIM,
     POLICY,
     FakeEmbedder,
     FakeStore,

@@ -12,7 +12,6 @@ from semantic_cache.gateway.guard_pool import (
     GuardPool,
     SegmentOutcome,
 )
-from semantic_cache.gateway.guard_vectors import SENTINEL_TEXT, GuardIndex
 
 EMBED_URL = "https://embed.example.com"
 DIM = 64
@@ -73,7 +72,10 @@ class FakeEmbedder:
             vector = np.roll(vector, shift % DIM)
         return vector
 
-    async def embed(self, texts, *, input_type="document"):
+    async def embed(self, texts, *, input_type="document", timeout=None):
+        # `timeout` mirrors the real GuardEmbedder. A double that does not
+        # accept what the pool actually passes is how a wiring gap survives a
+        # green suite; TimeoutRecordingEmbedder below asserts on the value.
         self.call_count += 1
         self.text_count += len(texts)
         if self.delay:
@@ -496,3 +498,50 @@ def test_breakers_are_per_index_not_global() -> None:
     pool.record_failure("a")
     assert pool.breaker_is_open("a") is True
     assert pool.breaker_is_open("b") is False
+
+
+# --------------------------------------------------------------------------- #
+# Build budget
+# --------------------------------------------------------------------------- #
+
+
+class TimeoutRecordingEmbedder(FakeEmbedder):
+    """FakeEmbedder that records the per-call timeout the pool asked for."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.timeouts = []
+
+    async def embed(self, texts, *, input_type="document", timeout=None):
+        self.timeouts.append(timeout)
+        return await super().embed(texts, input_type=input_type)
+
+
+async def test_the_build_runs_on_the_build_budget_not_the_request_budget() -> None:
+    """SC_GUARD_BUILD_TIMEOUT is the documented budget for embedding a policy,
+    and the build is shielded and server-owned precisely so it may take that
+    long. It shared the REQUEST embedder's much shorter timeout, so the build
+    budget was unreachable and a policy could never finish building against an
+    endpoint slower than one request."""
+    pool = _pool(build_timeout=45.0)
+    embedder = TimeoutRecordingEmbedder()
+    await pool.get_index(pool.resolve(_config()), embedder)
+
+    assert embedder.timeouts, "the build made no embedding call"
+    assert all(t == 45.0 for t in embedder.timeouts), embedder.timeouts
+
+
+async def test_the_stored_index_sentinel_check_also_gets_the_build_budget() -> None:
+    """The warm path still makes one live embedding call to verify the
+    sentinel. On the request timeout that call fails on exactly the endpoints
+    the cold build already failed on — a warm start was no safer."""
+    store = FakeStore()
+    pool = _pool(store, build_timeout=45.0)
+    resolved = pool.resolve(_config())
+    await pool.get_index(resolved, TimeoutRecordingEmbedder())
+
+    reloaded = _pool(store, build_timeout=45.0)
+    embedder = TimeoutRecordingEmbedder()
+    await reloaded.get_index(reloaded.resolve(_config()), embedder)
+
+    assert embedder.timeouts == [45.0]

@@ -28,7 +28,7 @@ FIX-4  GaaS summed raw similarities with no floor, so on a small policy the
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Mapping, Optional, Sequence
+from typing import List, Literal, Mapping, Optional, Sequence
 
 Action = Literal["block", "allow", "flag"]
 Mode = Literal["cascade", "embedding-only", "judge-only", "max"]

@@ -41,15 +41,15 @@ class LangChainSemanticCache(BaseCache):
             # We pass llm_string in metadata to track which LLM generated it,
             # though semantic search primarily relies on the prompt.
             result = self.cache_manager.search(prompt, llm_string=llm_string)
-            
+
             if result:
                 logger.info(f"LangChain Cache HIT for prompt: {prompt[:30]}... (Similarity: {result['similarity']:.4f})")
-                
+
                 # Reconstruct the LangChain Generation object
                 return [Generation(text=result["response"])]
-                
+
             return None
-            
+
         except Exception as e:
             # LangChain caches should generally fail silently and fallback to actual LLM call
             logger.error(f"LangChain semantic cache lookup failed: {e}")
@@ -69,11 +69,11 @@ class LangChainSemanticCache(BaseCache):
         try:
             # Extract the raw text from the LLM completion
             text_response = return_val[0].text
-            
+
             # Check if metadata in llm_string suggests keeping forever
             # (In standard LangChain this isn't native, but if you inject tags manually you can parse them)
             keep_forever = "KEEP_FOREVER" in llm_string
-            
+
             # Save to Redis
             self.cache_manager.set(
                 query=prompt,
@@ -82,7 +82,7 @@ class LangChainSemanticCache(BaseCache):
                 keep_forever=keep_forever
             )
             logger.debug("LangChain Cache UPDATED.")
-            
+
         except Exception as e:
             # Fail silently to not crash the main LLM pipeline
             logger.error(f"LangChain semantic cache update failed: {e}")

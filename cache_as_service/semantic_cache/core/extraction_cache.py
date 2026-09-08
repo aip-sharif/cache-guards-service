@@ -40,7 +40,6 @@ import redis
 
 from semantic_cache.core.entity_extractor import BaseEntityExtractor
 from semantic_cache.core.entity_extractor_async import BaseAsyncEntityExtractor
-from semantic_cache.core.exceptions import EntityExtractionError
 from semantic_cache.core import metrics
 
 logger = logging.getLogger(__name__)

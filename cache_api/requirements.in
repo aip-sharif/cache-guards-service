@@ -15,15 +15,17 @@ PyYAML>=6.0.1
 cryptography>=42.0.0
 alembic>=1.13.0
 
-# [FIX] بدون این pin، pip-compile (که با پایتون 3.12 اجرا شد) نسخه‌ی
-# websockets==17.0.1 رو انتخاب می‌کرد که نیاز به پایتون >=3.11 داره - ولی
-# Dockerfile از python:3.10-slim استفاده می‌کنه. این constraint مطمئن
-# می‌شه نسخه‌ای انتخاب بشه که با runtime واقعی (3.10) سازگاره.
 # [FIX] aiohttp روی پایتون <3.11 به async-timeout هم نیاز داره (وابستگی
-# شرطی/marker-based). چون pip-compile رو با پایتون 3.12 اجرا کردیم، این
-# شرط false ارزیابی شد و pip-compile اصلاً pin/hashش نکرد - نتیجه‌ش این
-# بود که --require-hashes روی پایتون 3.10 (که واقعاً بهش نیاز داره) fail
-# می‌کرد. با pin صریح، مجبورش می‌کنیم حتماً resolve و hash بشه.
+# شرطی/marker-based). چون pip-compile اولیه رو با پایتون 3.12 اجرا کرده
+# بودیم، این شرط false ارزیابی شده بود و pin/hash نشده بود. با uv
+# pip compile --python-version 3.10 این مشکل رفع شد ولی برای اطمینان
+# صریح هم اینجا نگه‌داری می‌شه.
 async-timeout==5.0.1
 
 websockets<17
+
+# [FIX] pytest-cov نیاز به coverage[toml]>=7.10.6 داره (یه requirement با
+# extras جدا از coverage ساده) که در حالت --require-hashes باید صریح pin
+# بشه، وگرنه pip می‌گه "نسخه‌بندی نشده". با pin کردن دقیقاً همون نسخه‌ای
+# که coverage ساده هم resolve شده (7.15.4)، هر دو با هم سازگار می‌مونن.
+coverage[toml]==7.15.4

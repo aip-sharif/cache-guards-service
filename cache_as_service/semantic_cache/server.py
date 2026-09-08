@@ -19,15 +19,24 @@ from typing import Any, Optional
 
 from fastapi import FastAPI
 
+from semantic_cache.adapters.ops_router import (
+    install_body_limit,
+    install_http_metrics,
+    ops_router,
+)
+from semantic_cache.adapters.readiness import Check, ReadinessProbe
 from semantic_cache.adapters.saas_router import (
     get_admin_key,
+    get_jwt_verifier,
     get_manager_pool,
+    get_readiness,
     get_redis,
     get_registry,
     health_router,
     saas_router,
 )
 from semantic_cache.core.config import SemanticCacheConfig
+from semantic_cache.saas.jwt_auth import JwtVerifier
 from semantic_cache.core.embedding_manager import EmbeddingManagerFactory
 from semantic_cache.infrastructure.redis_client import RedisClientFactory
 from semantic_cache.observability import configure_logging, init_sentry
@@ -40,6 +49,34 @@ def _secret(value: Any) -> Optional[str]:
     if value is None:
         return None
     return value.get_secret_value() if hasattr(value, "get_secret_value") else value
+
+
+def _url_reachable(url: Optional[str], timeout: float = 2.0):
+    """A readiness probe that asks only "does something answer HTTP here?".
+
+    ANY status code counts, 401 and 403 included: these endpoints are
+    per-key-authenticated and readiness has no key to present, so "the service
+    is up" is the strongest honest claim. Only a transport failure — DNS,
+    refused connection, TLS, timeout — is down.
+
+    Uses stdlib urllib rather than httpx: the probe runs in the readiness
+    thread pool, and borrowing the gateway's async clients from another thread
+    is a race for no benefit at one request per scrape."""
+    import urllib.error
+    import urllib.request
+
+    def probe() -> bool:
+        if not url:
+            return False
+        try:
+            urllib.request.urlopen(url, timeout=timeout)  # noqa: S310 — our own config
+            return True
+        except urllib.error.HTTPError:
+            return True  # it answered; the status is not ours to satisfy
+        except Exception:  # noqa: BLE001 — transport failure is "down"
+            return False
+
+    return probe
 
 
 def create_app(config: Optional[SemanticCacheConfig] = None) -> FastAPI:
@@ -70,7 +107,14 @@ def create_app(config: Optional[SemanticCacheConfig] = None) -> FastAPI:
             "unaffected.", e,
         )
 
-    registry = SaaSRegistry(redis_client)
+    api_key_pepper = _secret(cfg.api_key_pepper) or None
+    if not api_key_pepper:
+        logging.getLogger(__name__).warning(
+            "SC_API_KEY_PEPPER is not set — API keys are stored as a bare "
+            "sha256, which anyone who can read the Redis keyspace can check a "
+            "guess against offline. Set it; existing keys migrate on use."
+        )
+    registry = SaaSRegistry(redis_client, pepper=api_key_pepper)
     pool = ManagerPool(
         base_config=cfg,
         redis_client=redis_client,
@@ -78,13 +122,44 @@ def create_app(config: Optional[SemanticCacheConfig] = None) -> FastAPI:
     )
     admin_key = _secret(cfg.admin_api_key) or None
 
+    # SSO. A JwtConfigError here is deliberately FATAL: an SSO block that names
+    # an algorithm it has no key for accepts nothing, and a service that boots
+    # green while rejecting every login is worse than one that refuses to boot.
+    jwt_verifier = JwtVerifier(
+        shared_secret=_secret(cfg.sso_shared_secret) or None,
+        jwks_url=cfg.sso_jwks_url,
+        issuer=cfg.sso_issuer,
+        audience=cfg.sso_audience,
+        algorithms=cfg.sso_algorithms,
+        leeway=cfg.sso_leeway,
+        jwks_ttl=cfg.sso_jwks_ttl,
+    )
+    if not jwt_verifier.configured:
+        logging.getLogger(__name__).warning(
+            "SSO JWT verification is DISABLED (no SC_SSO_JWKS_URL or "
+            "SC_SSO_SHARED_SECRET) — JWT bearer tokens are rejected and only "
+            "minted sc-... API keys authenticate."
+        )
+
+    # Readiness is assembled AS the app is wired, so it can only ever name
+    # dependencies this process actually took on. A hand-maintained list would
+    # drift the first time a mode is added — which is how /health came to
+    # check Redis and nothing else while the gateway quietly needed four more.
+    readiness_checks = [Check("redis", redis_client.ping)]
+
     app = FastAPI(title="Semantic Cache SaaS", version="1.0.0")
+    install_http_metrics(app)
+    # Outermost, so an oversized body is refused before any handler, any
+    # validation, and any per-request instrumentation runs on it.
+    install_body_limit(app, cfg.max_request_bytes)
     app.dependency_overrides[get_registry] = lambda: registry
     app.dependency_overrides[get_manager_pool] = lambda: pool
     app.dependency_overrides[get_admin_key] = lambda: admin_key
     app.dependency_overrides[get_redis] = lambda: redis_client
+    app.dependency_overrides[get_jwt_verifier] = lambda: jwt_verifier
     app.include_router(saas_router)
     app.include_router(health_router)
+    app.include_router(ops_router)
 
     # OpenAI-compatible gateway. It has ONE surface — /v1 serving — because the
     # APP mints and validates the client keys; this service never does. /v1
@@ -113,7 +188,11 @@ def create_app(config: Optional[SemanticCacheConfig] = None) -> FastAPI:
         from semantic_cache.gateway.guard_judge import GuardJudge
         from semantic_cache.gateway.guard_log import GuardDecisionLog
         from semantic_cache.gateway.guard_pool import GuardPool
-        from semantic_cache.gateway.guard_vectors import GuardEmbedder
+        from semantic_cache.gateway.guard_vectors import (
+            GuardEmbedder,
+            judge_timeout,
+            request_embed_timeout,
+        )
         from semantic_cache.gateway.pool import GatewayModelPool
         from semantic_cache.gateway.router import (
             GatewaySettings,
@@ -135,6 +214,9 @@ def create_app(config: Optional[SemanticCacheConfig] = None) -> FastAPI:
         store = PostgresGatewayStore(pg_dsn)
         store.ensure_schema()
         app.dependency_overrides[get_gateway_store] = lambda: store
+        # Serving needs Postgres, so readiness must too — this is the exact
+        # dependency a Redis-only probe reported healthy without.
+        readiness_checks.append(Check("postgres", store.ping))
 
         if all(serving_env.values()):
             # Durable cache backup: Redis serves, Postgres mirrors. Rebuild
@@ -168,7 +250,17 @@ def create_app(config: Optional[SemanticCacheConfig] = None) -> FastAPI:
                 config_http,
                 url=cfg.app_config_url,
                 ttl=cfg.app_config_ttl,
+                max_entries=cfg.app_config_max_entries,
+                service_key=_secret(cfg.app_service_key) or None,
+                service_key_header=cfg.app_service_key_header,
             )
+            if not app_config.authenticates_as_a_service:
+                logging.getLogger(__name__).warning(
+                    "SC_APP_SERVICE_KEY is not set — we identify to the APP "
+                    "using only the caller's own key. Anyone holding a client "
+                    "key can then pull that client's model-provider "
+                    "credentials from the APP directly."
+                )
 
             # A THIRD client for the guard, for the same reason the first two
             # are separate: the guard is inline and fail-closed, so a judge
@@ -194,18 +286,27 @@ def create_app(config: Optional[SemanticCacheConfig] = None) -> FastAPI:
             )
 
             def _guard_embedder(resolved):
+                # This embedder serves the REQUEST path; GuardPool overrides
+                # the timeout per call for the index build, which has its own
+                # SC_GUARD_BUILD_TIMEOUT budget. Both values must scale with
+                # their setting — the former `min(1.5, guard_timeout / 3)` and
+                # `min(3.0, guard_timeout)` were ceilings, so SC_GUARD_TIMEOUT
+                # was inert and an endpoint slower than 1.5s could not be
+                # reached by any configuration at all.
                 return GuardEmbedder(
                     guard_http,
                     base_url=resolved.embed_base_url,
                     api_key=resolved.embed_api_key,
                     model=resolved.embed_model,
                     prefix_style=resolved.params.embed_prefix_style,
-                    timeout=min(1.5, cfg.guard_timeout / 3),
+                    timeout=request_embed_timeout(
+                        cfg.guard_timeout, resolved.params.mode
+                    ),
                 )
 
             guard_checker = GuardChecker(
                 guard_pool,
-                GuardJudge(guard_http, timeout=min(3.0, cfg.guard_timeout)),
+                GuardJudge(guard_http, timeout=judge_timeout(cfg.guard_timeout)),
                 _guard_embedder,
                 timeout=cfg.guard_timeout,
             )
@@ -242,6 +343,24 @@ def create_app(config: Optional[SemanticCacheConfig] = None) -> FastAPI:
             app.dependency_overrides[get_guard_checker] = lambda: guard_checker
             app.dependency_overrides[get_guard_switch] = lambda: guard_switch
             app.dependency_overrides[get_guard_log] = lambda: guard_log
+            # The APP's config endpoint is on the critical path of every
+            # completion: no config, no serving. We probe it WITHOUT a bearer,
+            # so a 401/403 is success — it proves the endpoint is up and
+            # answering, which is all readiness can honestly assert about a
+            # per-key resource.
+            readiness_checks.append(
+                Check("app_config", _url_reachable(cfg.app_config_url))
+            )
+            # The mlops endpoints are reported but do NOT gate the pod: a
+            # completion against a down LLM is one failed request, whereas
+            # marking every replica unready over it takes the whole service
+            # out — including the cache hits that need no LLM at all.
+            readiness_checks.append(
+                Check("llm", _url_reachable(cfg.llm_base_url), required=False)
+            )
+            readiness_checks.append(
+                Check("embed", _url_reachable(guard_embed_url), required=False)
+            )
             if not cfg.guard_enabled:
                 logging.getLogger(__name__).warning(
                     "Input guard is DISABLED by SC_GUARD_ENABLED — every "
@@ -304,6 +423,11 @@ def create_app(config: Optional[SemanticCacheConfig] = None) -> FastAPI:
         logging.getLogger(__name__).warning(
             "Gateway NOT mounted — SC_PG_DSN is not set."
         )
+
+    # Registered last: `readiness_checks` is complete only once every mode has
+    # had its say.
+    probe = ReadinessProbe(readiness_checks, timeout=cfg.readiness_timeout)
+    app.dependency_overrides[get_readiness] = lambda: probe
     return app
 
 
