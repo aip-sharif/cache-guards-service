@@ -82,6 +82,11 @@ services:
       SC_SSO_ISSUER: "${SC_SSO_ISSUER:-}"
       SC_SSO_AUDIENCE: "${SC_SSO_AUDIENCE:-}"
       SC_MAX_REQUEST_BYTES: "${SC_MAX_REQUEST_BYTES:-1048576}"
+      # Shared secret proving to the APP that the caller is this service, as
+      # opposed to anyone replaying a client key. Not required to boot; without
+      # it a leaked client key alone can pull provider credentials from the APP.
+      SC_APP_SERVICE_KEY: "${SC_APP_SERVICE_KEY:-}"
+      SC_APP_SERVICE_KEY_HEADER: "${SC_APP_SERVICE_KEY_HEADER:-X-Service-Key}"
     depends_on:
       redis:
         condition: service_healthy

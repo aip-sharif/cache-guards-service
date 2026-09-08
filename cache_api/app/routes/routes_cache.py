@@ -248,7 +248,7 @@ def read_all_caches(
 # [S05 FIX] دیگه مقدار خودِ کلید لاگ نمی‌شه
 # مسیر ثابت "/key/..."، قبل از "/{project_id}"
 # ---------------------------------------------------------
-@router.get("/key", response_model=APIResponse)
+@router.get("/key", response_model=None)
 def read_cache_by_key(
     db: Session = Depends(get_session),
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
