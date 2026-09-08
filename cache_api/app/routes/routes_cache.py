@@ -262,11 +262,15 @@ def read_cache_by_key(
         raise HTTPException(status_code=404, detail="Cache not found")
  
     config = get_cache_config(db=db, cache_id=cache.id)
-    return APIResponse(
-        status_code=200,
-        message="Cache fetched successfully",
-        data=_build_cache_read(cache, config),
-    )
+    result = _build_cache_read(cache, config).model_dump()
+    result["status_code"] = 200
+    result["message"] = "Cache fetched successfully"
+    return result
+    # return APIResponse(
+    #     status_code=200,
+    #     message="Cache fetched successfully",
+    #     data=_build_cache_read(cache, config),
+    # )
 
 
 # ---------------------------------------------------------
