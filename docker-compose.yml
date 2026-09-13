@@ -223,6 +223,9 @@ services:
       - ./cache_api/.env
     environment:
       POSTGRES_HOST: app-db
+      # Guard warmup target. In-network the gateway is "api" on 8080 —
+      # "localhost" from inside this container would be the APP itself.
+      SC_GATEWAY_CHAT_URL: "${SC_GATEWAY_CHAT_URL:-http://api:8080/v1/chat/completions}"
     ports:
       - "8000:8000"
     depends_on:

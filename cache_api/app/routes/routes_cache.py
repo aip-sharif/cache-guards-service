@@ -2,7 +2,7 @@
 
 import logging
 import uuid
-from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
 from sqlmodel import Session
 
@@ -21,6 +21,7 @@ from ..utils.db_utils import (
     update_cache_config,
 )
 from ..utils.guard_utils import resolve_guard
+from ..utils.guard_warmup import warmup_guard
 from ..utils.proxy_utils import forward_to_upstream
 from ..models.schemas_cache import (
     CacheRegister,
@@ -114,6 +115,7 @@ def _build_gateway_config(cache, config) -> GatewayConfigResponse:
 @router.post("/register", response_model=APIResponse)
 async def register_cache(
     data: CacheRegister,
+    background: BackgroundTasks,
     db: Session = Depends(get_session),
     id_user: str = Depends(get_current_user_id),
 ):
@@ -166,6 +168,12 @@ async def register_cache(
         logger.exception("register_cache failed for id_user=%s", id_user)
         raise HTTPException(status_code=500, detail="Failed to register cache")
 
+    # [GUARD WARMUP] فقط وقتی guard واقعاً روشنه - بعد از commit، تا اگه
+    # gateway در دسترس نباشه رکورد ثبت‌شده دست‌نخورده بمونه.
+    # توکنِ Authorization همون cache_key (api_key) خودِ همین پروژه‌ست.
+    if resolved_guard:
+        background.add_task(warmup_guard, cache.cache_key, cache.llm_model)
+
     return APIResponse(
         status_code=201,
         message="Cache registered successfully",
@@ -181,10 +189,12 @@ async def register_cache(
 def edit_cache(
     cache_id: str,
     data: CacheEdit,
+    background: BackgroundTasks,
     db: Session = Depends(get_session),
     id_user: str = Depends(get_current_user_id),
 ):
     try:
+        resolved_guard = None
         update_data = data.model_dump(exclude_unset=True, exclude={"guard", "cache_config"})
 
         updated = update_cache(db=db, id=cache_id, id_user=id_user, data=update_data)
@@ -208,6 +218,11 @@ def edit_cache(
 
         if config_update and config:
             config = update_cache_config(db=db, cache_id=cache_id, data=config_update)
+
+        # [GUARD WARMUP] فقط وقتی خودِ guard توی همین درخواست عوض شده و
+        # نتیجه‌اش «روشن» بوده - policy جدید یعنی ایندکس جدید، پس دوباره warm می‌کنیم.
+        if resolved_guard:
+            background.add_task(warmup_guard, updated.cache_key, updated.llm_model)
 
         return APIResponse(
             status_code=200,
