@@ -3,6 +3,7 @@
 import logging
 import os
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import HTTPException
 from contextlib import asynccontextmanager
@@ -37,6 +38,15 @@ app = FastAPI(
     title="Cache Service API",
     version="1.0.0",
     lifespan=lifespan,
+)
+
+# CORS - allow requests from any frontend host
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # [A09 FIX] محدودیت سایز body + rate limit پایه
