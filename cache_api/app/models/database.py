@@ -43,12 +43,14 @@ class CacheConfig(SQLModel, table=True):
     id: str = Field(default=None, primary_key=True)
     cache_id: str = Field(default=None, foreign_key="cache.id", nullable=False, unique=True, index=True)
 
+    enabled: bool = Field(default=True, nullable=False)
+
     guard_enabled: bool = Field(default=False, nullable=False)
     guard_policy: str = Field(default=None, nullable=True)
     guard_config: dict = Field(default_factory=dict, sa_column=Column(JSON))
 
     cache_mode: object = Field(
-        default_factory=lambda: ["exact", "bm25", "fuzzy", "semantic"],
+        default_factory=lambda: ["off","exact", "bm25", "fuzzy", "semantic"],
         sa_column=Column(JSON),
     )
     semantic: dict = Field(

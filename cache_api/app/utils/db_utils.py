@@ -132,6 +132,7 @@ def delete_cache(db: Session, id: str, id_user: str):
 def create_cache_config(
     db: Session,
     cache_id: str,
+    enabled: bool = True,
     guard_enabled: bool = False,
     guard_policy: str = None,
     guard_config: dict = None,
@@ -156,6 +157,7 @@ def create_cache_config(
     config = CacheConfig(
         id=str(uuid.uuid4()),
         cache_id=cache_id,
+        enabled=enabled,
         guard_enabled=guard_enabled,
         guard_policy=guard_policy,
         **kwargs,

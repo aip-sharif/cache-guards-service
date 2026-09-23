@@ -167,6 +167,7 @@ Regular responses (everything except the flat `GET /cache`) are wrapped:
   "extaractor_key": null,
   "extractor_domain": null,
   "cache_config": {
+    "enabled": true,
     "cache_mode": ["exact", "bm25", "fuzzy", "semantic"],
     "semantic": {"similarity_threshold": 0.92},
     "bm25": {"scorer": "BM25", "min_score": 1.0},
@@ -180,8 +181,11 @@ Regular responses (everything except the flat `GET /cache`) are wrapped:
   }
 }
 ```
-`cache_config` and `guard` are both optional. `cache_mode` can be a single string
-or a list. More samples (including error cases) are in `register_test_samples.md`.
+`cache_config` and `guard` are both optional. `cache_config.enabled` defaults to
+`true` if not sent - set it to `false` to fully disable caching for the project
+(equivalent to `cache_mode: "off"`, but independent of it). `cache_mode` can be
+a single string or a list. More samples (including error cases) are in
+`register_test_samples.md`.
 
 ---
 

@@ -59,6 +59,7 @@ def _build_cache_read(cache, config) -> CacheRead:
                 **(config.guard_config or {}),
             }
         cache_config = {
+            "enabled": config.enabled,
             "cache_mode": config.cache_mode,
             "semantic": config.semantic,
             "bm25": config.bm25,
@@ -88,6 +89,7 @@ def _build_gateway_config(cache, config) -> GatewayConfigResponse:
         extractor_domain=cache.extractor_domain,
         project_id=cache.project_id,
         cache_config=CacheModeConfig(
+            enabled=config.enabled if config else True,
             cache_mode=config.cache_mode if config else ["exact", "bm25", "fuzzy", "semantic"],
             semantic=config.semantic if config else {"similarity_threshold": 0.92},
             bm25=config.bm25 if config else {"scorer": "BM25", "min_score": 1.0},
@@ -146,6 +148,7 @@ async def register_cache(
         config = create_cache_config(
             db=db,
             cache_id=cache.id,
+            enabled=cc.enabled if cc else True,
             guard_enabled=bool(resolved_guard.enabled) if resolved_guard else False,
             guard_policy=resolved_guard.policy if resolved_guard else None,
             guard_config=_guard_extra_fields(resolved_guard),
@@ -211,6 +214,7 @@ def edit_cache(
             config_update["guard_config"] = _guard_extra_fields(resolved_guard)
 
         if data.cache_config is not None:
+            config_update["enabled"] = data.cache_config.enabled
             config_update["cache_mode"] = data.cache_config.cache_mode
             config_update["semantic"] = data.cache_config.semantic.model_dump()
             config_update["bm25"] = data.cache_config.bm25.model_dump()

@@ -120,7 +120,8 @@ class FuzzyConfig(BaseModel):
 class CacheModeConfig(BaseModel):
     """اختیاری - در صورت نبود، مقادیر پیش‌فرض استفاده می‌شن.
     cache_mode می‌تونه یک رشته (یک متد) یا لیست (زنجیره) باشه."""
-    cache_mode: Union[str, List[str]] = ["exact", "bm25", "fuzzy", "semantic"]
+    enabled: bool = True
+    cache_mode: Union[str, List[str]] = ["off","exact", "bm25", "fuzzy", "semantic"]
     semantic: SemanticConfig = SemanticConfig()
     bm25: Bm25Config = Bm25Config()
     fuzzy: FuzzyConfig = FuzzyConfig()
