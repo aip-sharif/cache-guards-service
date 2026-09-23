@@ -346,6 +346,15 @@ class SemanticCacheConfig(BaseSettings):
     # with which models, comes ENTIRELY from the APP's config response — these
     # are operator limits and fallbacks only. NONE of them is required and none
     # gates the /v1 mount (SC_EXTRACTOR_BASE_URL is the precedent).
+    cache_enabled: bool = Field(
+        default=True,
+        description=(
+            "Operator break-glass for the gateway cache (SC_CACHE_ENABLED). "
+            "False makes EVERY request a pure passthrough for every client, "
+            "without touching the APP. Entries are kept, not purged. Also "
+            "flippable at runtime via POST /admin/cache."
+        ),
+    )
     guard_enabled: bool = Field(
         default=True,
         description=(

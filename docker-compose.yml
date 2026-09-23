@@ -59,6 +59,8 @@ services:
       # healthcheck below: with restart: unless-stopped, a judge outage would
       # otherwise become a container restart loop.
       SC_GUARD_ENABLED: "${SC_GUARD_ENABLED:-true}"
+      # Operator switch for the cache; runtime via POST /admin/cache.
+      SC_CACHE_ENABLED: "${SC_CACHE_ENABLED:-true}"
       SC_GUARD_TIMEOUT: "${SC_GUARD_TIMEOUT:-5.0}"
       SC_GUARD_BUILD_TIMEOUT: "${SC_GUARD_BUILD_TIMEOUT:-60.0}"
       SC_GUARD_MAX_EXEMPLARS: "${SC_GUARD_MAX_EXEMPLARS:-5000}"

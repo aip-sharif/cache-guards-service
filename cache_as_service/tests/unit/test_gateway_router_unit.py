@@ -458,3 +458,122 @@ def test_caller_can_read_own_messages(env) -> None:
     body = r.json()
     assert body[0]["query_text"] == "capital of france?"
     assert body[0]["cache_hit"] is False
+
+
+# --------------------------------------------------------------------------- #
+# Turning the cache off — per client (APP) and for everyone (operator)
+# --------------------------------------------------------------------------- #
+
+ADMIN_KEY = "sc-admin-test"
+
+
+def _wire_switch(env, enabled=True):
+    from semantic_cache.adapters.saas_router import get_admin_key
+    from semantic_cache.gateway.router import CacheSwitch, get_cache_switch
+
+    switch = CacheSwitch(enabled=enabled)
+    app = env.client.app
+    app.dependency_overrides[get_cache_switch] = lambda: switch
+    app.dependency_overrides[get_admin_key] = lambda: ADMIN_KEY
+    return switch
+
+
+def _assert_passthrough(env, calls_before=0):
+    _chat(env)
+    _chat(env)
+    assert len(env.spy.calls) == calls_before + 2   # both went upstream
+    assert [m["cache_hit"] for m in env.store.messages][-2:] == [False, False]
+
+
+def test_app_can_switch_cache_off_per_client_with_enabled_false(env) -> None:
+    env.app_config.default = dict(
+        APP_CONFIG, cache_config={"enabled": False, "cache_mode": "bm25"}
+    )
+    _assert_passthrough(env)
+    assert env.pool.rows == []                       # pool never consulted
+
+
+def test_switching_back_on_keeps_the_clients_cache_mode(env) -> None:
+    """Why `enabled` exists next to cache_mode "off": re-enabling must not
+    lose which method the client had chosen."""
+    env.app_config.default = dict(
+        APP_CONFIG, cache_config={"enabled": True, "cache_mode": "bm25"}
+    )
+    _chat(env)
+    assert env.pool.rows[0]["cache_config"] == {"cache_mode": "bm25"}
+
+
+def test_enabled_is_not_forwarded_to_the_pool(env) -> None:
+    """The pool rejects fields it does not know; `enabled` is the router's."""
+    env.app_config.default = dict(APP_CONFIG, cache_config={"enabled": True})
+    assert _chat(env).status_code == 200
+    assert "enabled" not in env.pool.rows[0]["cache_config"]
+
+
+def test_a_non_boolean_enabled_is_a_config_error(env) -> None:
+    """"false" as a string must not quietly mean ON."""
+    env.app_config.default = dict(APP_CONFIG, cache_config={"enabled": "false"})
+    r = _chat(env)
+    assert r.status_code == 502
+    assert env.spy.calls == []
+
+
+def test_operator_switch_off_bypasses_the_cache_for_every_client(env) -> None:
+    _wire_switch(env, enabled=False)
+    _assert_passthrough(env)
+    assert env.pool.rows == []
+
+
+def test_admin_cache_route_flips_it_at_runtime(env) -> None:
+    switch = _wire_switch(env)
+    _chat(env)
+    _chat(env)
+    assert len(env.spy.calls) == 1                   # second was a cache hit
+
+    r = env.client.post("/admin/cache", json={"enabled": False},
+                        headers={"Authorization": f"Bearer {ADMIN_KEY}"})
+    assert r.status_code == 200 and r.json() == {"enabled": False}
+    assert switch.enabled is False
+    _chat(env)
+    assert len(env.spy.calls) == 2                   # off: straight upstream
+
+    env.client.post("/admin/cache", json={"enabled": True},
+                    headers={"Authorization": f"Bearer {ADMIN_KEY}"})
+    _chat(env)
+    assert len(env.spy.calls) == 2                   # on again: stored entry served
+
+
+def test_admin_cache_route_needs_the_admin_key(env) -> None:
+    switch = _wire_switch(env)
+    r = env.client.post("/admin/cache", json={"enabled": False},
+                        headers={"Authorization": "Bearer wrong"})
+    assert r.status_code == 403
+    assert switch.enabled is True
+    assert env.client.post("/admin/cache", json={"enabled": False}).status_code == 401
+
+
+def test_admin_cache_route_is_503_when_no_switch_is_wired(env) -> None:
+    from semantic_cache.adapters.saas_router import get_admin_key
+
+    env.client.app.dependency_overrides[get_admin_key] = lambda: ADMIN_KEY
+    r = env.client.post("/admin/cache", json={"enabled": False},
+                        headers={"Authorization": f"Bearer {ADMIN_KEY}"})
+    assert r.status_code == 503
+
+
+def test_admin_cache_state_is_readable(env) -> None:
+    _wire_switch(env, enabled=False)
+    auth = {"Authorization": f"Bearer {ADMIN_KEY}"}
+    assert env.client.get("/admin/cache", headers=auth).json() == {"enabled": False}
+    env.client.post("/admin/cache", json={"enabled": True}, headers=auth)
+    assert env.client.get("/admin/cache", headers=auth).json() == {"enabled": True}
+    assert env.client.get("/admin/cache").status_code == 401
+
+
+def test_admin_guard_state_is_readable(env) -> None:
+    _wire_switch(env)
+    auth = {"Authorization": f"Bearer {ADMIN_KEY}"}
+    assert env.client.get("/admin/guard", headers=auth).json() == {"enabled": True}
+    assert env.client.get(
+        "/admin/guard", headers={"Authorization": "Bearer wrong"}
+    ).status_code == 403

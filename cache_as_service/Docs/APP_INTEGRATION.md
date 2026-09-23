@@ -162,6 +162,21 @@ cascade):
 | `"exact"` | L0 exact-match **only** — one normalized-text (+scope) lookup. | no | Deterministic caching, zero false-hit risk, cheapest tier. |
 | `"off"` | Caching disabled — pure passthrough (still logged). Scalar only. | no | A client that must never be served a cached answer. |
 
+#### Turning a client's cache off and on again — `cache_config.enabled`
+
+```json
+"cache_config": {"enabled": false, "cache_mode": "bm25"}   // off, bm25 remembered
+"cache_config": {"enabled": true,  "cache_mode": "bm25"}   // back on, as bm25
+```
+
+`enabled` is the on/off switch; `cache_mode` stays whatever the client chose.
+That is the difference from `"cache_mode": "off"`, which *replaces* the method,
+so switching back on means remembering what it was. Omitted = `true`. A
+non-boolean (`"false"` as a string) is rejected with `502` rather than guessed.
+Stored entries are kept while off and served again once it is back on (their
+TTLs keep running). The guard is independent: `guard.enabled` controls it the
+same way (§2b), and turning one off never touches the other.
+
 **Single method (string).** The exact pre-check (`exact_tier`) is applied in
 front of it when enabled — so `"semantic"` with `exact_tier` on means "exact,
 then vector."
@@ -705,6 +720,31 @@ SC_GUARD_JUDGE_BASE_URL=         # defaults to SC_LLM_BASE_URL
 guard off for every client at runtime, with no redeploy — the break-glass for
 an incident where a fail-closed guard is refusing traffic.
 
+### 4.6b Cache on/off — for every client
+
+```bash
+SC_CACHE_ENABLED=true            # false → every request is a passthrough
+```
+
+`POST /admin/cache {"enabled": false}` (bearer `SC_ADMIN_API_KEY`) does the
+same at runtime, no redeploy. Use it when the cache is up but wrong — stale
+answers, a bad threshold, an incident you want to rule the cache out of.
+Entries are kept, not purged; `{"enabled": true}` resumes serving them.
+
+`GET /admin/cache` and `GET /admin/guard` (same bearer) return the current
+`{"enabled": …}` of the replica that answers.
+
+Both switches, cache and guard, work the same way at two levels:
+
+| Level | Cache | Guard |
+|---|---|---|
+| One client (the APP decides) | `cache_config.enabled: false` | `guard.enabled: false` |
+| Every client (the operator decides) | `SC_CACHE_ENABLED` / `POST /admin/cache` | `SC_GUARD_ENABLED` / `POST /admin/guard` |
+
+**The `/admin/*` switches are per process.** A `POST` flips the one replica
+that receives it, and a restart reverts it to the env value. With more than one
+replica, set the env var and restart — that is the fleet-wide lever.
+
 ### 4.7 Deploy
 
 ```bash
@@ -780,6 +820,7 @@ a feature is good to have.
 | `SC_ENVIRONMENT` | no | `production` | Tag surfaced to logs and Sentry. |
 | `SC_SENTRY_DSN` | no | — | Error reporting. Needs the `[sentry]` extra. |
 | `SC_SENTRY_TRACES_SAMPLE_RATE` | no | `0.0` | Tracing is off by default. |
+| `SC_CACHE_ENABLED` | no | `true` | Operator switch: `false` makes every request a passthrough. Runtime: `POST /admin/cache`. |
 | `SC_GUARD_*` | no | see §4.6 | Operator limits and break-glass only. |
 
 `.env.example` is the annotated version of this table and is the file to copy.

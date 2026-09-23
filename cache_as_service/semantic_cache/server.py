@@ -205,6 +205,8 @@ def create_app(config: Optional[SemanticCacheConfig] = None) -> FastAPI:
             get_guard_checker,
             get_guard_log,
             get_guard_switch,
+            get_cache_switch,
+            CacheSwitch,
             get_upstream,
             install_openai_error_handlers,
         )
@@ -272,6 +274,7 @@ def create_app(config: Optional[SemanticCacheConfig] = None) -> FastAPI:
             )
             guard_embed_url = cfg.guard_embed_base_url or cfg.embed_base_url
             guard_switch = GuardSwitch(enabled=cfg.guard_enabled)
+            cache_switch = CacheSwitch(enabled=cfg.cache_enabled)
             guard_log = GuardDecisionLog(store)
             guard_pool = GuardPool(
                 store,
@@ -342,6 +345,7 @@ def create_app(config: Optional[SemanticCacheConfig] = None) -> FastAPI:
             app.dependency_overrides[get_gateway_settings] = lambda: settings
             app.dependency_overrides[get_guard_checker] = lambda: guard_checker
             app.dependency_overrides[get_guard_switch] = lambda: guard_switch
+            app.dependency_overrides[get_cache_switch] = lambda: cache_switch
             app.dependency_overrides[get_guard_log] = lambda: guard_log
             # The APP's config endpoint is on the critical path of every
             # completion: no config, no serving. We probe it WITHOUT a bearer,
@@ -361,6 +365,11 @@ def create_app(config: Optional[SemanticCacheConfig] = None) -> FastAPI:
             readiness_checks.append(
                 Check("embed", _url_reachable(guard_embed_url), required=False)
             )
+            if not cfg.cache_enabled:
+                logging.getLogger(__name__).warning(
+                    "Cache is DISABLED by SC_CACHE_ENABLED — every request is "
+                    "a passthrough to the upstream."
+                )
             if not cfg.guard_enabled:
                 logging.getLogger(__name__).warning(
                     "Input guard is DISABLED by SC_GUARD_ENABLED — every "

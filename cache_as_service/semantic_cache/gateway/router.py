@@ -32,7 +32,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from semantic_cache.adapters.saas_router import _bearer, get_admin_key
+from semantic_cache.adapters.saas_router import _bearer, require_admin
 from semantic_cache.gateway.app_config import AppConfigClient, AppConfigError
 from semantic_cache.gateway.chat import (
     UNGUARDABLE,
@@ -75,11 +75,26 @@ class GuardSwitch(BaseModel):
     """Operator break-glass, MUTABLE at runtime.
 
     A frozen setting would mean redeploying a `restart: unless-stopped`
-    container while a misbehaving fail-closed guard refuses every request. The
-    cache needs no such switch — it degrades silently on its own.
+    container while a misbehaving fail-closed guard refuses every request.
+
+    Per-process: POST /admin/guard flips ONE replica. The fleet-wide lever is
+    SC_GUARD_ENABLED plus a restart.
     """
 
     enabled: bool = True
+
+
+class CacheSwitch(GuardSwitch):
+    """The same break-glass for the cache: off means every request is a pure
+    passthrough, for every client, until switched back on.
+
+    The cache fails open on its own when Redis is DOWN. This is for when it is
+    UP and wrong — stale answers, a bad threshold, an incident you want to rule
+    the cache out of — which "degrades silently" never covered.
+
+    Stored entries are untouched while off and are served again when the
+    switch comes back on (their TTLs keep running meanwhile).
+    """
 
 
 def get_gateway_store() -> PostgresGatewayStore:
@@ -112,6 +127,13 @@ def get_guard_switch() -> GuardSwitch:
 
 def get_guard_log() -> Any:
     raise NotImplementedError("Dependency get_guard_log must be overridden.")
+
+
+def get_cache_switch() -> Optional[CacheSwitch]:
+    """None → no operator switch wired; per-client cache_config still applies.
+    Not NotImplementedError like its siblings: an embedding app that never
+    heard of the switch keeps working exactly as before."""
+    return None
 
 
 gateway_router = APIRouter(tags=["OpenAI Gateway"])
@@ -185,7 +207,12 @@ def _model_row(config: Dict[str, Any], settings: GatewaySettings) -> Dict[str, A
         "extractor_api_key": config["extractor_api_key"] if has_extractor else None,
         "extractor_model": config["extractor_model"] if has_extractor else None,
         "extractor_domain": config.get("extractor_domain"),
-        "cache_config": config.get("cache_config") or {},
+        # `enabled` is the on/off switch, read by the router; it is not a
+        # cache setting, and the pool rejects fields it does not know.
+        "cache_config": {
+            k: v for k, v in (config.get("cache_config") or {}).items()
+            if k != "enabled"
+        },
     }
 
 
@@ -260,6 +287,7 @@ async def chat_completions(
     guard: Optional[GuardChecker] = Depends(get_guard_checker),
     guard_switch: GuardSwitch = Depends(get_guard_switch),
     guard_log: Any = Depends(get_guard_log),
+    cache_switch: Optional[CacheSwitch] = Depends(get_cache_switch),
 ):
     started = time.monotonic()
     request_id = str(uuid.uuid4())
@@ -281,12 +309,27 @@ async def chat_completions(
         (payload.get("stream_options") or {}).get("include_usage")
     )
 
-    # The client (via the APP) may turn caching off entirely — a pure
-    # passthrough. We honor it here so an 'off' client never even pays the
-    # manager's one-time embedding-dimension probe. 'off' is only the scalar
-    # cache_mode; a cache_mode LIST (cascade) always means caching is ON.
-    _cm = (model_row["cache_config"] or {}).get("cache_mode", "semantic")
-    cache_off = isinstance(_cm, str) and _cm.lower() == "off"
+    # Three ways to turn caching off, checked here so an 'off' request never
+    # even pays the manager's one-time embedding-dimension probe:
+    #   1. the operator, for EVERY client (SC_CACHE_ENABLED / POST /admin/cache)
+    #   2. the APP, per client, with cache_config.enabled = false — which KEEPS
+    #      the client's cache_mode, so switching back on restores it
+    #   3. the APP, per client, with the scalar cache_mode "off"
+    # A cache_mode LIST (cascade) always means caching is ON.
+    raw_cc = config.get("cache_config") or {}
+    cache_enabled = raw_cc.get("enabled", True)
+    if not isinstance(cache_enabled, bool):
+        # Same stance as guard.enabled: an ambiguous switch is a config error,
+        # not a guess. "false" as a string must not quietly mean ON.
+        return _openai_error(
+            502, "Config from APP is invalid: cache_config.enabled must be a boolean."
+        )
+    _cm = raw_cc.get("cache_mode", "semantic")
+    cache_off = (
+        (cache_switch is not None and not cache_switch.enabled)
+        or not cache_enabled
+        or (isinstance(_cm, str) and _cm.lower() == "off")
+    )
 
     # Cache only requests a cached plain answer can faithfully serve.
     bypass = (
@@ -560,11 +603,9 @@ class GuardSwitchRequest(BaseModel):
     enabled: bool
 
 
-@gateway_router.post("/admin/guard")
+@gateway_router.post("/admin/guard", dependencies=[Depends(require_admin)])
 async def set_guard_switch(
     body: GuardSwitchRequest,
-    authorization: Optional[str] = Header(default=None),
-    admin_key: Optional[str] = Depends(get_admin_key),
     switch: GuardSwitch = Depends(get_guard_switch),
 ):
     """Operator break-glass: turn the guard off (or on) for EVERY client.
@@ -575,13 +616,44 @@ async def set_guard_switch(
     redeploying a `restart: unless-stopped` container while a fail-closed guard
     refuses 100% of traffic.
     """
-    if not admin_key:
-        raise HTTPException(503, "No admin key configured (SC_ADMIN_API_KEY).")
-    if _bearer(authorization) != admin_key:
-        raise HTTPException(403, "Invalid admin key.")
     switch.enabled = body.enabled
     logger.critical(
         "Input guard %s for ALL clients via /admin/guard.",
+        "ENABLED" if body.enabled else "DISABLED",
+    )
+    return {"enabled": switch.enabled}
+
+
+def _require_cache_switch(switch: Optional[CacheSwitch]) -> CacheSwitch:
+    if switch is None:
+        raise HTTPException(503, "Cache switch is not wired in this app.")
+    return switch
+
+
+@gateway_router.get("/admin/guard", dependencies=[Depends(require_admin)])
+async def get_guard_state(switch: GuardSwitch = Depends(get_guard_switch)):
+    """Current state of THIS replica's guard switch."""
+    return {"enabled": switch.enabled}
+
+
+@gateway_router.get("/admin/cache", dependencies=[Depends(require_admin)])
+async def get_cache_state(switch: Optional[CacheSwitch] = Depends(get_cache_switch)):
+    """Current state of THIS replica's cache switch."""
+    return {"enabled": _require_cache_switch(switch).enabled}
+
+
+@gateway_router.post("/admin/cache", dependencies=[Depends(require_admin)])
+async def set_cache_switch(
+    body: GuardSwitchRequest,
+    switch: Optional[CacheSwitch] = Depends(get_cache_switch),
+):
+    """Operator break-glass: turn the cache off (or on) for EVERY client.
+
+    Off = pure passthrough to the upstream, still message-logged. Entries are
+    kept, not purged, so switching back on resumes serving them."""
+    _require_cache_switch(switch).enabled = body.enabled
+    logger.critical(
+        "Cache %s for ALL clients via /admin/cache.",
         "ENABLED" if body.enabled else "DISABLED",
     )
     return {"enabled": switch.enabled}
