@@ -30,6 +30,7 @@ from ..models.schemas_cache import (
     APIResponse,
     GatewayConfigResponse,
     CacheModeConfig,
+    GuardConfig,
 )
 from ..auth import bearer_scheme, get_current_user_id, verify_service_key
 
@@ -47,12 +48,32 @@ def _guard_extra_fields(guard) -> dict:
     return {k: v for k, v in data.items() if k not in _GUARD_ENABLED_POLICY_KEYS}
 
 
+def _merge_guard(config, incoming: GuardConfig) -> GuardConfig:
+    """
+    guard ذخیره‌شده (enabled + policy + بقیه‌ی تنظیمات) رو پایه قرار می‌ده و
+    فقط فیلدهایی که کلاینت واقعاً فرستاده روش override می‌کنه - یعنی edit
+    جزئی: مثلاً فقط {"enabled": false} بقیه‌ی guard رو دست‌نخورده نگه می‌داره.
+    """
+    base = {}
+    if config:
+        base = {
+            "enabled": config.guard_enabled,
+            "policy": config.guard_policy,
+            **(config.guard_config or {}),
+        }
+    base.update(incoming.model_dump(exclude_unset=True))
+    return GuardConfig(**base)
+
+
 def _build_cache_read(cache, config) -> CacheRead:
     data = cache.model_dump()
     guard = None
     cache_config = None
     if config:
-        if config.guard_enabled:
+        # guard خاموش ولی تنظیم‌شده هم برگردونده می‌شه (با enabled=false)
+        # تا کاربر ببینه policy/تنظیماتش سر جاشه؛ gateway از _build_gateway_config
+        # می‌خونه که همچنان فقط guard روشن رو می‌فرسته.
+        if config.guard_enabled or config.guard_policy:
             guard = {
                 "enabled": config.guard_enabled,
                 "policy": config.guard_policy,
@@ -208,10 +229,23 @@ def edit_cache(
 
         config_update = {}
         if "guard" in data.model_fields_set:
-            resolved_guard = resolve_guard(data.guard, id_user)
-            config_update["guard_enabled"] = bool(resolved_guard.enabled) if resolved_guard else False
-            config_update["guard_policy"] = resolved_guard.policy if resolved_guard else None
-            config_update["guard_config"] = _guard_extra_fields(resolved_guard)
+            if data.guard is None:
+                # "guard": null -> خاموش کامل (رفتار قبلی)
+                config_update["guard_enabled"] = False
+                config_update["guard_config"] = {}
+            else:
+                merged = _merge_guard(config, data.guard)
+                if merged.enabled is False:
+                    # فقط خاموش کن - policy و تنظیمات قبلی حفظ می‌شن تا
+                    # بعداً با {"enabled": true} دوباره روشن بشه
+                    config_update["guard_enabled"] = False
+                    config_update["guard_policy"] = merged.policy
+                    config_update["guard_config"] = _guard_extra_fields(merged)
+                else:
+                    resolved_guard = resolve_guard(merged, id_user)
+                    config_update["guard_enabled"] = bool(resolved_guard.enabled) if resolved_guard else False
+                    config_update["guard_policy"] = resolved_guard.policy if resolved_guard else None
+                    config_update["guard_config"] = _guard_extra_fields(resolved_guard)
 
         if data.cache_config is not None:
             config_update["enabled"] = data.cache_config.enabled
