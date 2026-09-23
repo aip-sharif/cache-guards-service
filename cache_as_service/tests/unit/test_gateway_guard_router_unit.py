@@ -538,3 +538,42 @@ def test_the_admin_switch_takes_effect_without_a_restart(env) -> None:
     env.client.post("/admin/guard", json={"enabled": True},
                     headers={"Authorization": f"Bearer {ADMIN_KEY}"})
     assert _chat(env, "bad").json()["guardrail"]["action"] == "block"
+
+
+# --------------------------------------------------------------------------- #
+# A policy whose examples do not fit its thresholds
+# --------------------------------------------------------------------------- #
+
+MISFIT = (
+    "guard.policy cannot separate its own examples with these thresholds "
+    "(allow_threshold=0.4, block_threshold=0.85, min_similarity=0.6): 1 of 4 "
+    "example(s) affected.\n1. allowed example 'refund?': ... Fix: raise "
+    "guard.block_threshold above 0.90."
+)
+
+
+def _misfit():
+    return GuardOutcome(action="unavailable", reason="config_invalid",
+                        detail=MISFIT)
+
+
+def test_a_misfit_policy_is_a_502_that_explains_itself(env) -> None:
+    """Not the 503 "retry shortly": retrying changes nothing, the APP has to
+    change the thresholds or the examples — so tell it which."""
+    env.guard.outcome = _misfit()
+    response = _chat(env, "hello")
+    assert response.status_code == 502
+    message = response.json()["error"]["message"]
+    assert "Fix: raise guard.block_threshold above 0.90" in message
+    assert "Retry shortly" not in message
+    assert env.spy.calls == []
+
+
+def test_a_misfit_policy_never_degrades_to_unguarded(env) -> None:
+    """degrade_to_unguarded is for outages. Applied to a config error it would
+    switch a misconfigured guard off silently — the failure mode this guard
+    exists to make loud."""
+    env.guard.resolved = FakeResolved(degrade_to_unguarded=True)
+    env.guard.outcome = _misfit()
+    assert _chat(env, "hello").status_code == 502
+    assert env.spy.calls == []

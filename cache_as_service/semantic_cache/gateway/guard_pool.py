@@ -52,7 +52,12 @@ from semantic_cache.gateway.guard_config import (
     ResolvedGuard,
     derive_guard_config,
 )
-from semantic_cache.gateway.guard_logic import Neighbor, classify, separability_report
+from semantic_cache.gateway.guard_logic import (
+    Neighbor,
+    classify,
+    explain_separability,
+    separability_report,
+)
 from semantic_cache.gateway.guard_vectors import (
     SENTINEL_TEXT,
     GuardIndex,
@@ -75,6 +80,10 @@ class _IndexEntry:
     task: Optional["asyncio.Future"] = None
     index: Optional[GuardIndex] = None
     nbytes: int = 0
+    #: params_hash -> error message, or None when that parameter set passed.
+    #: Thresholds are free to change without a re-embed, so the separability
+    #: verdict is per PARAMETER SET, not per matrix.
+    separability: Dict[str, Optional[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -206,6 +215,7 @@ class GuardPool:
         if entry is not None:
             self._indexes.move_to_end(resolved.index_key)
             if entry.index is not None:
+                self._verify_separable(resolved, entry)
                 return entry.index
         else:
             entry = _IndexEntry()
@@ -227,6 +237,7 @@ class GuardPool:
         entry.nbytes = index.nbytes
         self._index_bytes += entry.nbytes
         self._evict_indexes()
+        self._verify_separable(resolved, entry)
         return index
 
     async def _build(
@@ -270,7 +281,6 @@ class GuardPool:
                 resolved.index_key[:12], index.n, index.dim, elapsed,
                 resolved.embed_model,
             )
-            self._run_separability(resolved, index)
             await asyncio.to_thread(
                 self._store.save_guard_index,
                 resolved.index_key, resolved.embed_model, resolved.policy_hash,
@@ -333,8 +343,31 @@ class GuardPool:
         await asyncio.to_thread(self._store.touch_guard_index, resolved.index_key)
         return index
 
-    def _run_separability(self, resolved: ResolvedGuard, index: GuardIndex) -> None:
-        """Leave-one-out check that this policy can separate its own examples."""
+    def _verify_separable(self, resolved: ResolvedGuard, entry: _IndexEntry) -> None:
+        """Raises GuardConfigError when THESE thresholds cannot separate the
+        policy's own examples. Once per (matrix, parameter set).
+
+        It used to run inside the build, which had two consequences. A policy
+        that passed once was never checked again: change the thresholds and
+        the matrix came back from memory or Postgres unexamined, so the new
+        values went live untested. And a policy that failed was never SAVED,
+        so every request re-embedded every exemplar only to fail again —
+        paying for the whole policy on each attempt to fix it.
+        """
+        key = resolved.params_hash
+        if key not in entry.separability:
+            # ponytail: O(n^2) leave-one-out on the event loop, as before; move
+            # to a thread if a 5000-exemplar policy's pause ever shows up.
+            entry.separability[key] = self._run_separability(resolved, entry.index)
+        error = entry.separability[key]
+        if error is not None:
+            raise GuardConfigError(error)
+
+    def _run_separability(
+        self, resolved: ResolvedGuard, index: GuardIndex
+    ) -> Optional[str]:
+        """Leave-one-out check that this policy can separate its own examples.
+        Returns the error message, or None."""
         params = resolved.params
         scored = _leave_one_out(index, params.top_k, params.min_similarity)
         report = separability_report(
@@ -351,13 +384,12 @@ class GuardPool:
                 "allow_threshold and block_threshold.",
                 resolved.policy_hash[:12], report.judge_rate * 100,
             )
-        if not report.ok:
-            first = report.failures[0]
-            raise GuardConfigError(
-                f"guard.policy cannot separate its own examples with these "
-                f"thresholds: {first.problem} (exemplar: {first.text!r}). "
-                f"{len(report.failures)} exemplar(s) affected."
-            )
+        if report.ok:
+            return None
+        return explain_separability(
+            report, scored, params.allow_threshold, params.block_threshold,
+            params.min_similarity,
+        )
 
     def _evict_indexes(self) -> None:
         # Never evict down to nothing: one index over the byte budget still has
@@ -492,7 +524,8 @@ def _leave_one_out(
                 for j in top
             ]
             result = classify(neighbors, min_similarity)
-            out.append((index.texts[i], index.labels[i], result.score))
+            best = max(n.similarity for n in neighbors)
+            out.append((index.texts[i], index.labels[i], result.score, best))
     return out
 
 

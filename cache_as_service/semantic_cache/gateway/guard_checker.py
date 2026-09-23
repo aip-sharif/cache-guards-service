@@ -92,6 +92,9 @@ class GuardOutcome:
     judge_invoked: bool = False
     top_matches: List[Neighbor] = field(default_factory=list)
     latency_ms: Optional[int] = None
+    #: Human-readable cause. Only `config_invalid` sends it to the caller;
+    #: other reasons can carry internal detail and stay in our logs.
+    detail: str = ""
 
     @property
     def blocked(self) -> bool:
@@ -365,6 +368,7 @@ class GuardChecker:
             refusal=(
                 resolved.params.unavailable_refusal or DEFAULT_UNAVAILABLE_REFUSAL
             ),
+            detail=detail,
         )
 
 

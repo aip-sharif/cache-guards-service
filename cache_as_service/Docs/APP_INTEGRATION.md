@@ -392,6 +392,58 @@ within one config TTL. Changing the *policy text*, the embedding model, its key
 or the prefix style re-embeds every exemplar, billed to that client's embedding
 key.
 
+### When your examples do not fit your thresholds
+
+Before a policy serves traffic we score **every example against all the
+others** (leave-one-out) with the thresholds you sent. Each example must land
+on its own side:
+
+* an **allowed** example must score *below* `block_threshold`, or the policy
+  would refuse its own example of acceptable traffic;
+* a **disallowed** example must score *above* `allow_threshold`, or the policy
+  would let its own example of a violation through;
+* a **disallowed** example that scores exactly `0.000` means no other example
+  reached `min_similarity` at all — the floor is too high for your embedding
+  model, and that violation would be **allowed**.
+
+If any example fails, the request gets **`502`** and the message says what
+happened and what to change. It runs again **every time you change a
+threshold** (free: nothing is re-embedded), and on a policy change (after the
+re-embed). Example, real output:
+
+```
+Guard config from APP is invalid: guard.policy cannot separate its own
+examples with these thresholds (allow_threshold=0.4, block_threshold=0.85,
+min_similarity=0.99): 2 of 4 example(s) affected.
+1. disallowed example 'Is Rivalco better than you?': scores 0.000 because NO
+   exemplar cleared min_similarity … Fix: lower guard.min_similarity to 0.47
+   or below (the closest other example scored 0.47), or add more disallowed
+   examples that resemble this one.
+Start with min_similarity: while it discards every neighbour, no threshold
+can help.
+```
+
+What the message gives you:
+
+| Part | Meaning |
+|---|---|
+| first line | the thresholds we tested, and how many examples failed |
+| numbered lines (up to 5) | each failing example, its score, and a `Fix:` — the exact value to move a threshold past, or which example to reword |
+| `Thresholds that would pass this check: …` | a threshold pair that would make every example fit |
+| `But your examples overlap …` | that pair exists, but only with a wide ambiguous band: an allowed example scores higher than a disallowed one. **Change the examples** — reword the allowed one, or add clearer disallowed ones |
+| `Start with min_similarity …` | fix the floor first; until then no threshold can help |
+
+Two rules the fix must respect:
+
+* **Thresholds or examples — you choose.** Moving a threshold is instant and
+  free. Changing examples re-embeds the policy. When the message reports
+  overlap, change the examples.
+* **This error is never degraded to unguarded**, even with
+  `degrade_to_unguarded: true`. That flag covers outages (embedder or judge
+  down). A policy that cannot separate its own examples is a config error, and
+  switching a misconfigured guard off in silence is the failure a loud error
+  prevents.
+
 ### What gets checked — `check_roles`
 
 Default `["user", "system", "tool"]`. Whichever you choose, **every** message
@@ -495,6 +547,7 @@ that should be decided.
 | `401` / `403` / `404` (key unknown / no config) | `403` "The APP has no model config for this key." |
 | `5xx`, invalid JSON, missing required fields, unreachable | `502` |
 | a `guard` block we cannot use (unknown field, bad policy, missing switch) | `502` + `Retry-After: 30`, message naming the problem |
+| a guard whose examples do not fit its thresholds | `502` + `Retry-After: 30`, message naming each failing example and what to change — see "When your examples do not fit your thresholds". Never degraded. |
 | a usable guard that cannot RUN (embedder or judge down) | `503` + `Retry-After: 5` — or served unguarded if that client set `degrade_to_unguarded` |
 
 Notes for the APP implementer:

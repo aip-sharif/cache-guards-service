@@ -426,6 +426,18 @@ async def chat_completions(
             )
         _log_guard(outcome, resolved_guard)
 
+        if outcome.action == "unavailable" and outcome.reason == "config_invalid":
+            # The policy's own examples do not fit its thresholds. That is the
+            # APP's config, not an outage: same 502 as any other invalid guard
+            # block, with the explanation and the fix. Never degraded to
+            # unguarded — a misconfigured guard silently switching itself off
+            # is exactly what a loud failure here prevents — and never the
+            # 503 "retry shortly", because retrying changes nothing.
+            return _openai_error(
+                502, f"Guard config from APP is invalid: {outcome.detail}",
+                retry_after=30,
+            )
+
         if outcome.action == "unavailable":
             if resolved_guard.params.degrade_to_unguarded:
                 logger.critical(

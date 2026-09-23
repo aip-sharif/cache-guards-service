@@ -545,3 +545,47 @@ async def test_the_stored_index_sentinel_check_also_gets_the_build_budget() -> N
     await reloaded.get_index(reloaded.resolve(_config()), embedder)
 
     assert embedder.timeouts == [45.0]
+
+
+# --------------------------------------------------------------------------- #
+# Separability is checked per PARAMETER SET, and a failure costs no re-embed
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_threshold_change_after_a_good_build_is_rechecked() -> None:
+    """The bug: the check ran only inside the build. Once a policy had built,
+    new thresholds came back with the cached matrix and went live untested."""
+    pool = _pool()
+    embedder = FakeEmbedder()
+    await pool.get_index(pool.resolve(_config()), embedder)          # passes
+
+    bad = pool.resolve(_config(allow_threshold=0.0, block_threshold=0.0))
+    with pytest.raises(GuardConfigError, match="cannot separate its own examples"):
+        await pool.get_index(bad, embedder)
+
+
+async def test_fixing_the_thresholds_needs_no_re_embed() -> None:
+    """The other half: a failing policy was never saved, so every attempt to
+    fix it re-embedded every exemplar. Thresholds are free to change."""
+    pool = _pool()
+    embedder = FakeEmbedder()
+    bad = pool.resolve(_config(allow_threshold=0.0, block_threshold=0.0))
+    with pytest.raises(GuardConfigError):
+        await pool.get_index(bad, embedder)
+    calls = embedder.call_count
+
+    with pytest.raises(GuardConfigError):                            # retry
+        await pool.get_index(bad, embedder)
+    await pool.get_index(pool.resolve(_config()), embedder)          # fixed
+    assert embedder.call_count == calls
+
+
+async def test_the_error_says_what_to_change() -> None:
+    pool = _pool()
+    bad = pool.resolve(_config(allow_threshold=0.0, block_threshold=0.0))
+    with pytest.raises(GuardConfigError) as err:
+        await pool.get_index(bad, FakeEmbedder())
+    message = str(err.value)
+    assert "Fix:" in message
+    assert "block_threshold" in message
+    assert "allow_threshold=0.0" in message                          # echoes input

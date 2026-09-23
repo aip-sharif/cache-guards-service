@@ -98,6 +98,8 @@ class SeparabilityFailure:
     label: str
     score: float
     problem: str
+    #: What to change. Written for the person editing the policy, not for us.
+    fix: str = ""
 
 
 @dataclass(frozen=True)
@@ -358,7 +360,11 @@ def separability_report(
     """
     failures: List[SeparabilityFailure] = []
     in_band = 0
-    for text, label, score in scores_by_exemplar:
+    for row in scores_by_exemplar:
+        # A 4th element, when present, is the similarity of this exemplar's
+        # closest OTHER exemplar — what min_similarity would have to drop to.
+        text, label, score = row[0], row[1], row[2]
+        best = row[3] if len(row) > 3 else None
         if allow_threshold < score < block_threshold:
             in_band += 1
         if label == "disallowed" and score == 0.0:
@@ -376,6 +382,14 @@ def separability_report(
                 "neighbour was discarded and this violation would be ALLOWED. "
                 "Lower guard.min_similarity (it is model-dependent, not a "
                 "portable constant)",
+                fix=(
+                    f"lower guard.min_similarity to {best:.2f} or below (the "
+                    f"closest other example scored {best:.2f}), or add more "
+                    f"disallowed examples that resemble this one"
+                    if best is not None else
+                    "lower guard.min_similarity, or add more disallowed "
+                    "examples that resemble this one"
+                ),
             ))
             continue
         if label == "allowed" and score >= block_threshold:
@@ -384,6 +398,11 @@ def separability_report(
                 f"allowed exemplar scores {score:.3f}, at or above "
                 f"block_threshold {block_threshold} — this policy would refuse "
                 f"its own example of acceptable traffic",
+                fix=(
+                    f"raise guard.block_threshold above {score:.2f}, or reword "
+                    f"or remove this allowed example — it sits too close to "
+                    f"your disallowed examples"
+                ),
             ))
         elif label == "disallowed" and score <= allow_threshold:
             failures.append(SeparabilityFailure(
@@ -391,9 +410,72 @@ def separability_report(
                 f"disallowed exemplar scores {score:.3f}, at or below "
                 f"allow_threshold {allow_threshold} — this policy would allow "
                 f"its own example of a violation",
+                fix=(
+                    f"lower guard.allow_threshold below {score:.2f}, or add "
+                    f"more disallowed examples that resemble this one"
+                ),
             ))
     total = len(scores_by_exemplar) or 1
     return SeparabilityReport(failures=failures, judge_rate=in_band / total)
+
+
+def explain_separability(
+    report: SeparabilityReport,
+    scores_by_exemplar: Sequence[tuple],
+    allow_threshold: float,
+    block_threshold: float,
+    min_similarity: float,
+    limit: int = 5,
+) -> str:
+    """The message the APP sees: what failed, and what to change.
+
+    Returned to the caller verbatim (HTTP 502), so it names the knobs by their
+    config names and gives numbers, not "adjust your thresholds". When some
+    threshold pair WOULD pass, it says which; when the examples themselves
+    overlap, it says that no threshold choice is a real fix.
+    """
+    n = len(report.failures)
+    lines = [
+        f"guard.policy cannot separate its own examples with these thresholds "
+        f"(allow_threshold={allow_threshold}, block_threshold={block_threshold}, "
+        f"min_similarity={min_similarity}): {n} of {len(scores_by_exemplar)} "
+        f"example(s) affected."
+    ]
+    for i, f in enumerate(report.failures[:limit], 1):
+        text = f.text if len(f.text) <= 80 else f.text[:77] + "..."
+        lines.append(f"{i}. {f.label} example {text!r}: {f.problem}. Fix: {f.fix}.")
+    if n > limit:
+        lines.append(f"...and {n - limit} more.")
+
+    zero = any(r[1] == "disallowed" and r[2] == 0.0 for r in scores_by_exemplar)
+    allowed = [r[2] for r in scores_by_exemplar if r[1] == "allowed"]
+    disallowed = [r[2] for r in scores_by_exemplar
+                  if r[1] == "disallowed" and r[2] > 0.0]
+    if zero:
+        lines.append(
+            "Start with min_similarity: while it discards every neighbour, no "
+            "threshold can help."
+        )
+    elif allowed and disallowed:
+        hi_allowed, lo_disallowed = max(allowed), min(disallowed)
+        if hi_allowed >= 1.0:
+            lines.append(
+                "No block_threshold can pass: an allowed example scores 1.00. "
+                "Reword or remove it."
+            )
+        else:
+            lines.append(
+                f"Thresholds that would pass this check: allow_threshold below "
+                f"{lo_disallowed:.2f} and block_threshold above {hi_allowed:.2f}."
+            )
+            if lo_disallowed <= hi_allowed:
+                lines.append(
+                    f"But your examples overlap (an allowed one scores "
+                    f"{hi_allowed:.2f}, a disallowed one {lo_disallowed:.2f}), "
+                    f"so the ambiguous band would be wide. Changing the "
+                    f"examples is the better fix."
+                )
+    return "\n".join(lines)
 
 
 __all__ = [
@@ -413,4 +495,5 @@ __all__ = [
     "decide",
     "refusal_for",
     "separability_report",
+    "explain_separability",
 ]
