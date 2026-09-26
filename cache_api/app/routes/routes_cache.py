@@ -256,6 +256,10 @@ def edit_cache(
 
         if config_update and config:
             config = update_cache_config(db=db, cache_id=cache_id, data=config_update)
+            # commit دوم (توی update_cache_config) آبجکت `updated` رو expire می‌کنه
+            # و model_dump() روش dict خالی برمی‌گردونه -> CacheRead با
+            # "Field required" خطا می‌داد. دوباره از دیتابیس می‌خونیمش.
+            db.refresh(updated)
 
         # [GUARD WARMUP] فقط وقتی خودِ guard توی همین درخواست عوض شده و
         # نتیجه‌اش «روشن» بوده - policy جدید یعنی ایندکس جدید، پس دوباره warm می‌کنیم.
