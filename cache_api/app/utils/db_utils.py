@@ -5,7 +5,11 @@ from ..config import DATABASE_URL
 from sqlmodel import SQLModel, create_engine, Session, select
 from ..models.database import User, Cache, CacheConfig
 
-engine = create_engine(DATABASE_URL)
+# [F4 FIX] pool_pre_ping: کانکشن مرده (مثلاً بعد از ری‌استارت Postgres) قبل از
+# استفاده تشخیص داده می‌شه. connect_timeout: وقتی دیتابیس در دسترس نیست،
+# /health سریع 503 بده به‌جای اینکه منتظر timeout سیستم‌عامل بمونه.
+_connect_args = {"connect_timeout": 5} if DATABASE_URL.startswith("postgresql") else {}
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args=_connect_args)
 
 
 def create_db_and_tables():

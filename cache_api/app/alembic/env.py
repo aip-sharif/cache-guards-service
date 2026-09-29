@@ -1,3 +1,4 @@
+# [F4 FIX] alembic فقط env.py رو اجرا می‌کنه؛ alembic_env.py قبلی هیچ‌وقت اجرا نمی‌شد.
 import sys
 import os
 from logging.config import fileConfig
@@ -5,15 +6,17 @@ from logging.config import fileConfig
 from sqlalchemy import engine_from_config, pool
 from alembic import context
 
-# اضافه کردن ریشه‌ی پروژه به sys.path تا بتونیم app رو import کنیم
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+# [F4 FIX] ریشه‌ی cache_api (دو سطح بالاتر از app/alembic/) باید روی sys.path
+# باشه تا `import app...` کار کنه - قبلاً app/ اضافه می‌شد که پکیج app رو پیدا نمی‌کرد.
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 from app.config import DATABASE_URL  # noqa: E402
 from app.models.database import SQLModel  # noqa: E402
 import app.models.database  # noqa: E402,F401  - مطمئن می‌شه همه‌ی مدل‌ها import شدن
 
 config = context.config
-config.set_main_option("sqlalchemy.url", DATABASE_URL)
+# configparser روی "%" interpolation می‌کنه (مثلاً پسورد URL-encoded)
+config.set_main_option("sqlalchemy.url", DATABASE_URL.replace("%", "%%"))
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)

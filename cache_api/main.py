@@ -7,8 +7,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import HTTPException
 from contextlib import asynccontextmanager
+from sqlalchemy import text
 
-from app.utils.db_utils import create_db_and_tables
+from app.utils.db_utils import create_db_and_tables, engine
 from app.routes.routes_cache import router as cache_router
 from app.rate_limit import RateLimitMiddleware, BodySizeLimitMiddleware
 logging.basicConfig(
@@ -73,9 +74,28 @@ def root():
     return {"status": "ok", "message": "Cache Service is running"}
 
 
+# [F4 FIX] /health قبلاً همیشه 200 می‌داد، حتی وقتی Postgres پایین بود - پس
+# readiness probe ترافیک رو به پادی می‌فرستاد که نمی‌تونه جواب بده.
+# الان /health (readiness) دیتابیس رو چک می‌کنه و در صورت خطا 503 می‌ده؛
+# /live (liveness) فقط می‌گه پروسه بالاست - liveness نباید به دیتابیس
+# وابسته باشه، وگرنه قطعی Postgres باعث ری‌استارت پشت‌سرهم پادها می‌شه.
+@app.get("/live")
+def liveness_check():
+    return {"status": "alive"}
+
+
 @app.get("/health")
 def health_check():
-    return {"status": "healthy"}
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+    except Exception:
+        logger.exception("health check: database unreachable")
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unhealthy", "database": "unreachable"},
+        )
+    return {"status": "healthy", "database": "ok"}
 
 
 if __name__ == "__main__":

@@ -56,13 +56,21 @@ def get_current_user_id(
     if not user_info:
         raise HTTPException(status_code=401, detail="invalid_token")
 
+    # [F2 FIX] قبلاً هویت = owner + org_name بود؛ ولی Casdoor سازمان رو توی
+    # owner می‌ذاره و نام کاربری رو توی name - یعنی همه‌ی کاربرهای یه سازمان
+    # یه id_user مشترک می‌گرفتن و پروژه‌ها/کلیدهای همدیگه رو می‌دیدن.
+    # الان owner/name (همون شناسه‌ی استاندارد خودِ Casdoor) استفاده می‌شه؛
+    # "/" توی owner و name مجاز نیست، پس تصادم نمی‌ده.
     owner = user_info.get("owner")
-    org_name = user_info.get("org_name") or user_info.get("owner")
+    name = user_info.get("name")
 
-    if not owner:
-        raise HTTPException(status_code=401, detail="Token payload must contain 'owner'")
+    if not owner or not name:
+        raise HTTPException(
+            status_code=401,
+            detail="Token payload must contain 'owner' and 'name'",
+        )
 
-    return f"{owner}_{org_name}"
+    return f"{owner}/{name}"
 
 
 if not SC_GATEWAY_ADMIN_KEY:

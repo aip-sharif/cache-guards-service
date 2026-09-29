@@ -48,6 +48,17 @@ def _guard_extra_fields(guard) -> dict:
     return {k: v for k, v in data.items() if k not in _GUARD_ENABLED_POLICY_KEYS}
 
 
+def _cache_mode_is_off(mode) -> bool:
+    """cache_mode = "off" (یا لیستی که فقط "off" داره) یعنی کش خاموشه."""
+    if isinstance(mode, str):
+        return mode.strip().lower() == "off"
+    return bool(mode) and all(str(m).strip().lower() == "off" for m in mode)
+
+
+def _cache_is_on(cc) -> bool:
+    return bool(cc.enabled) and not _cache_mode_is_off(cc.cache_mode)
+
+
 def _merge_guard(config, incoming: GuardConfig) -> GuardConfig:
     """
     guard ذخیره‌شده (enabled + policy + بقیه‌ی تنظیمات) رو پایه قرار می‌ده و
@@ -92,6 +103,13 @@ def _build_cache_read(cache, config) -> CacheRead:
 
 
 def _build_gateway_config(cache, config) -> GatewayConfigResponse:
+    # [F1 FIX] gateway فقط cache_mode رو می‌فهمه و فیلد enabled رو نمی‌خونه؛
+    # پس کش خاموش باید به‌صورت cache_mode="off" (passthrough) بهش برسه.
+    cache_on = bool(config.enabled) if config else True
+    cache_mode = config.cache_mode if config else ["exact", "bm25", "fuzzy", "semantic"]
+    if not cache_on:
+        cache_mode = "off"
+
     guard_response = None
     if config and config.guard_enabled:
         guard_response = {
@@ -103,15 +121,15 @@ def _build_gateway_config(cache, config) -> GatewayConfigResponse:
     return GatewayConfigResponse(
         model=cache.llm_model,
         model_api_key=cache.llm_key,
-        embed_model=cache.embedd_model,
-        embed_api_key=cache.embedd_key,
+        embed_model=cache.embedd_model or None,
+        embed_api_key=cache.embedd_key or None,
         extractor_model=cache.extaractor,
         extractor_api_key=cache.extaractor_key,
         extractor_domain=cache.extractor_domain,
         project_id=cache.project_id,
         cache_config=CacheModeConfig(
-            enabled=config.enabled if config else True,
-            cache_mode=config.cache_mode if config else ["exact", "bm25", "fuzzy", "semantic"],
+            enabled=cache_on,
+            cache_mode=cache_mode,
             semantic=config.semantic if config else {"similarity_threshold": 0.92},
             bm25=config.bm25 if config else {"scorer": "BM25", "min_score": 1.0},
             fuzzy=config.fuzzy if config else {"distance": 2, "min_score": 0.5},
@@ -144,6 +162,24 @@ async def register_cache(
 ):
     resolved_guard = resolve_guard(data.guard, id_user)  # می‌تونه HTTPException(502) بندازه
 
+    # [F1 FIX] ثبت‌نام فقط-LLM: بدون مدل embedding، کش پیش‌فرض خاموش می‌شه
+    # (به‌جای کلیدی که همون اول با 502 سمت gateway رد بشه). اگه کلاینت
+    # صریحاً کش رو روشن خواسته ولی مدل embedding نداده، همین‌جا 400 می‌دیم.
+    cc = data.cache_config
+    has_embed = bool(data.embedd_model) and bool(data.embedd_key)
+    if cc is None:
+        cache_enabled = has_embed
+    else:
+        cache_enabled = cc.enabled
+        if _cache_is_on(cc) and not has_embed:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "embedd_model and embedd_key are required when caching is enabled "
+                    "(send cache_config.enabled=false for an LLM-only project)"
+                ),
+            )
+
     name = f"model_{uuid.uuid4().hex[:8]}"
     project_id = uuid.uuid4().hex
     api_key = f"sc-proj-{uuid.uuid4().hex}"
@@ -153,8 +189,9 @@ async def register_cache(
             db=db,
             id_user=id_user,
             name=name,
-            embedd_model=data.embedd_model,
-            embedd_key=data.embedd_key,
+            # ستون‌ها NOT NULL هستن؛ نبودِ مدل embedding = رشته‌ی خالی
+            embedd_model=data.embedd_model or "",
+            embedd_key=data.embedd_key or "",
             llm_model=data.llm_model,
             llm_key=data.llm_key,
             extaractor=data.extaractor,
@@ -165,11 +202,10 @@ async def register_cache(
             commit=False,  # هنوز commit نکن - می‌خوایم با config یکجا باشه
         )
 
-        cc = data.cache_config
         config = create_cache_config(
             db=db,
             cache_id=cache.id,
-            enabled=cc.enabled if cc else True,
+            enabled=cache_enabled,
             guard_enabled=bool(resolved_guard.enabled) if resolved_guard else False,
             guard_policy=resolved_guard.policy if resolved_guard else None,
             guard_config=_guard_extra_fields(resolved_guard),
@@ -219,6 +255,23 @@ def edit_cache(
 ):
     try:
         resolved_guard = None
+
+        # [F1 FIX] روشن کردن کش بدون مدل embedding (نه توی همین درخواست،
+        # نه ذخیره‌شده) = کلیدی که سمت gateway با 502 رد می‌شه؛ زودتر رد کن.
+        if data.cache_config is not None and _cache_is_on(data.cache_config):
+            current = get_cache(db=db, id=cache_id, id_user=id_user)
+            if current and not (
+                (data.embedd_model or current.embedd_model)
+                and (data.embedd_key or current.embedd_key)
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "embedd_model and embedd_key are required when caching is enabled "
+                        "(send cache_config.enabled=false for an LLM-only project)"
+                    ),
+                )
+
         update_data = data.model_dump(exclude_unset=True, exclude={"guard", "cache_config"})
 
         updated = update_cache(db=db, id=cache_id, id_user=id_user, data=update_data)
@@ -361,6 +414,11 @@ def read_cache(
 # ---------------------------------------------------------
 @router.get("", response_model=None)
 def gateway_config(
+    # [F3 FIX] این endpoint کلیدهای provider رو برمی‌گردونه؛ کلید پروژه
+    # به کاربر نهایی داده می‌شه، پس به‌تنهایی کافی نیست - باید خودِ gateway
+    # با X-Service-Key (SC_APP_SERVICE_KEY) صدا بزنه. اول چک می‌شه تا
+    # بدون service key حتی معتبر بودن/نبودن کلید پروژه هم لو نره.
+    _service: str = Depends(verify_service_key),
     db: Session = Depends(get_session),
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
 ):

@@ -131,8 +131,9 @@ class CacheRegister(BaseModel):
     """Body for POST /cache/register"""
     llm_model: str
     llm_key: str
-    embedd_model: str
-    embedd_key: str
+    # [F1 FIX] پروژه‌ی فقط-LLM (کش خاموش) مدل embedding لازم نداره
+    embedd_model: Optional[str] = None
+    embedd_key: Optional[str] = None
     extaractor: Optional[str] = None
     extaractor_key: Optional[str] = None
     extractor_domain: Optional[str] = None
@@ -160,8 +161,9 @@ class GatewayConfigResponse(BaseModel):
     """
     model: str
     model_api_key: str
-    embed_model: str
-    embed_api_key: str
+    # [F1 FIX] برای پروژه‌ی فقط-LLM خالیه (null)، نه رشته‌ی خالی
+    embed_model: Optional[str] = None
+    embed_api_key: Optional[str] = None
     extractor_model: Optional[str] = None
     extractor_api_key: Optional[str] = None
     extractor_domain: Optional[str] = None

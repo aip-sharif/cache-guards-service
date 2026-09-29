@@ -1,7 +1,7 @@
 """add enabled column to cacheconfig
 
 Revision ID: 0001_cacheconfig_enabled
-Revises:
+Revises: 0000_baseline
 Create Date: 2026-09-23
 
 """
@@ -12,12 +12,16 @@ import sqlmodel
 
 # revision identifiers, used by Alembic.
 revision = "0001_cacheconfig_enabled"
-down_revision = None
+down_revision = "0000_baseline"
 branch_labels = None
 depends_on = None
 
 
 def upgrade() -> None:
+    # دیتابیسی که با create_all (dev) ساخته شده ممکنه ستون رو از قبل داشته باشه
+    columns = {c["name"] for c in sa.inspect(op.get_bind()).get_columns("cacheconfig")}
+    if "enabled" in columns:
+        return
     # server_default=true تا ردیف‌های موجود هم مقدار true بگیرن (NOT NULL)
     op.add_column(
         "cacheconfig",

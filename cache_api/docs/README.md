@@ -12,7 +12,8 @@ endpoint an OpenAI-compatible **gateway** calls to resolve that configuration.
 Client → POST /cache/register (Casdoor auth)
        → mints a local id/project_id/cache_key, stores config
 
-Gateway → GET /cache   (Authorization: Bearer <the project's own cache_key>)
+Gateway → GET /cache   (Authorization: Bearer <the project's own cache_key>
+                        + X-Service-Key: <SC_APP_SERVICE_KEY>)
         → { model, model_api_key, embed_model, embed_api_key,
             extractor_model, extractor_api_key, extractor_domain,
             project_id, cache_config, guard }
@@ -124,12 +125,20 @@ python main.py
 | Type | Mechanism | Used for |
 |---|---|---|
 | End user | Casdoor JWT (`cassdoor_token` cookie or `Authorization: Bearer`) | `register`, `edit`, `/mine`, `/{project_id}` |
-| Project (gateway) | `Authorization: Bearer <cache_key>` | `GET /cache` (the gateway's main endpoint), `proxy/*` |
+| Gateway (service) | `Authorization: Bearer <cache_key>` **and** `X-Service-Key: <SC_APP_SERVICE_KEY>` | `GET /cache` (the gateway's main endpoint) |
+| Project | `Authorization: Bearer <cache_key>` | `proxy/*` |
 | Admin | `Authorization: Bearer <SC_GATEWAY_ADMIN_KEY>` (constant-time compare) | `GET /cache/key/{cache_key}` |
 
 Security notes:
 - If a JWT can't be verified (invalid signature/expired), the request is **rejected** —
   there is no unsafe fallback.
+- The user identity is `owner/name` from the Casdoor token (organization/username),
+  so every user in an organization is a separate tenant. A token without both
+  claims is rejected with 401.
+- `GET /cache` returns provider credentials, so the project key alone is not
+  enough: the gateway must also send `X-Service-Key` (header name configurable
+  via `SC_APP_SERVICE_KEY_HEADER`). Set the same `SC_APP_SERVICE_KEY` for the
+  gateway (root `.env`) and for cache_api (`cache_api/.env`).
 - If `SC_GATEWAY_ADMIN_KEY` isn't set in `.env`, the service refuses to start (fail closed).
 - Tokens/keys are never logged.
 
@@ -144,7 +153,9 @@ Security notes:
 | `GET /cache/mine` | Casdoor | List all of the caller's own projects |
 | `GET /cache/{project_id}` | Casdoor | Read one project (owner only) |
 | `GET /cache/key/{cache_key}` | Admin key | Look up a project by `cache_key` (debug/admin) |
-| `GET /cache` | Bearer `<cache_key>` | **The gateway's main endpoint** — raw `GatewayConfigResponse` shape |
+| `GET /cache` | Bearer `<cache_key>` + service key | **The gateway's main endpoint** — raw `GatewayConfigResponse` shape |
+| `GET /health` | none | Readiness: checks Postgres, `503` when unreachable |
+| `GET /live` | none | Liveness: process is up (no dependency checks) |
 | `POST /cache/proxy/chat/completions` | Bearer `<cache_key>` | Direct proxy to the project's own `llm_model` |
 | `POST /cache/proxy/embeddings` | Bearer `<cache_key>` | Direct proxy to the project's own `embedd_model` |
 
@@ -181,7 +192,11 @@ Regular responses (everything except the flat `GET /cache`) are wrapped:
   }
 }
 ```
-`cache_config` and `guard` are both optional. `cache_config.enabled` defaults to
+`cache_config` and `guard` are both optional. `embedd_model`/`embedd_key` are
+only required when caching is on: an LLM-only project omits them, and without a
+`cache_config` its cache is stored as disabled. Asking for caching
+(`cache_config.enabled=true` with a mode other than `"off"`) without them returns
+`400`. A disabled cache reaches the gateway as `cache_mode: "off"`. `cache_config.enabled` defaults to
 `true` if not sent - set it to `false` to fully disable caching for the project
 (equivalent to `cache_mode: "off"`, but independent of it). `cache_mode` can be
 a single string or a list. More samples (including error cases) are in
@@ -266,13 +281,17 @@ Runs on every push/PR to `main`/`develop`.
 
 ---
 
-## Migrating to Alembic (before production)
+## Database migrations (Alembic)
+
+`app/alembic/versions/0000_baseline.py` creates every table, so an empty
+Postgres is built entirely by migrations:
 
 ```bash
-docker compose exec api bash
-alembic revision --autogenerate -m "initial schema"
-alembic upgrade head
+# from cache_api/ (inside the container: /code)
+alembic -c app/alembic.ini upgrade head
 ```
-Then remove `SC_ENVIRONMENT=development` from `.env` and add `alembic upgrade
-head` as a separate deploy step before bringing the service up in your
-deployment pipeline.
+
+Run it as a deploy step before the service takes traffic, and remove
+`SC_ENVIRONMENT=development` in production. The baseline skips tables that
+already exist and `0001` skips the `enabled` column if it is there, so it is
+also safe on a database that was built by `create_all` in development.

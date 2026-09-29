@@ -120,3 +120,65 @@ def test_cannot_read_other_users_project(client, monkeypatch):
     read_response = client.get(f"/cache/{project_id}")
 
     assert read_response.status_code == 404  # نه 200 - نباید ببینتش
+
+
+# ---------------------------------------------------------
+# review 29-sep F2 - هویت = owner/name؛ دو کاربر یه سازمان نباید یه tenant باشن
+# ---------------------------------------------------------
+def _call_get_current_user_id(monkeypatch, payload):
+    from types import SimpleNamespace
+    import app.auth as auth
+
+    monkeypatch.setattr(auth, "parse_and_verify_access_token", lambda token: payload)
+    request = SimpleNamespace(cookies={})
+    credentials = SimpleNamespace(credentials="token")
+    return auth.get_current_user_id(request, credentials)
+
+
+def test_identity_is_owner_and_name(monkeypatch):
+    alice = _call_get_current_user_id(monkeypatch, {"owner": "sakoo", "name": "alice"})
+    bob = _call_get_current_user_id(monkeypatch, {"owner": "sakoo", "name": "bob"})
+    assert alice == "sakoo/alice"
+    assert bob == "sakoo/bob"
+    assert alice != bob
+
+
+def test_identity_without_name_is_rejected(monkeypatch):
+    with pytest.raises(HTTPException) as exc:
+        _call_get_current_user_id(monkeypatch, {"owner": "sakoo"})
+    assert exc.value.status_code == 401
+
+
+# ---------------------------------------------------------
+# review 29-sep F3 - GET /cache بدون service key نباید جواب بده
+# ---------------------------------------------------------
+def test_gateway_config_requires_service_key():
+    import inspect
+    from app.auth import verify_service_key
+    from app.routes.routes_cache import gateway_config
+
+    param = inspect.signature(gateway_config).parameters["_service"]
+    assert param.default.dependency is verify_service_key
+
+
+# ---------------------------------------------------------
+# review 29-sep F1 - کش خاموش به gateway به‌صورت cache_mode="off" می‌رسه و
+# embedding خالی null برمی‌گرده (نه رشته‌ی خالی)
+# ---------------------------------------------------------
+def test_disabled_cache_reaches_gateway_as_off():
+    from types import SimpleNamespace
+    from app.routes.routes_cache import _build_gateway_config
+
+    cache = SimpleNamespace(
+        llm_model="gpt-x", llm_key="sk-llm", embedd_model="", embedd_key="",
+        extaractor=None, extaractor_key=None, extractor_domain=None, project_id="p1",
+    )
+    config = SimpleNamespace(
+        enabled=False, guard_enabled=False, guard_policy=None, guard_config={},
+        cache_mode=["exact", "bm25"], semantic={"similarity_threshold": 0.92},
+        bm25={"scorer": "BM25", "min_score": 1.0}, fuzzy={"distance": 2, "min_score": 0.5},
+    )
+    result = _build_gateway_config(cache, config)
+    assert result.cache_config.cache_mode == "off"
+    assert result.embed_model is None
+    assert result.embed_api_key is None
