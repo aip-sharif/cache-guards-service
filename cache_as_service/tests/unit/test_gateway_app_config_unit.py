@@ -107,12 +107,22 @@ async def test_app_5xx_and_bad_json_map_to_502() -> None:
 
 @pytest.mark.asyncio
 async def test_missing_required_fields_map_to_502() -> None:
-    body = {k: v for k, v in GOOD.items() if k != "embed_api_key"}
+    body = {k: v for k, v in GOOD.items() if k != "model_api_key"}
     with pytest.raises(AppConfigError) as e:
         await _client(AppSpy(body=body)).resolve("k")
     assert e.value.status_code == 502
     # reported under the APP's own field name
-    assert "embedd_key" in str(e.value)
+    assert "llm_key" in str(e.value)
+
+
+@pytest.mark.asyncio
+async def test_llm_only_config_resolves_without_embedding() -> None:
+    """An LLM-only registration stores empty embedd_model/embedd_key."""
+    body = dict(APP_REAL, embedd_model="", embedd_key="")
+    config = await _client(AppSpy(body=body)).resolve("k")
+    assert config["model"] == "gpt-4o-mini"
+    assert config["embed_model"] is None
+    assert config["embed_api_key"] is None
 
 
 @pytest.mark.asyncio
@@ -167,10 +177,10 @@ async def test_reads_the_apps_extractor_spelling() -> None:
 
 @pytest.mark.asyncio
 async def test_missing_app_fields_named_in_the_error() -> None:
-    body = {k: v for k, v in APP_REAL.items() if k != "embedd_key"}
+    body = {k: v for k, v in APP_REAL.items() if k != "llm_key"}
     with pytest.raises(AppConfigError) as e:
         await _client(AppSpy(body=body)).resolve("k")
-    assert "embedd_key" in str(e.value)
+    assert "llm_key" in str(e.value)
 
 
 @pytest.mark.asyncio

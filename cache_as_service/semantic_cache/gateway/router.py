@@ -315,6 +315,7 @@ async def chat_completions(
     #   2. the APP, per client, with cache_config.enabled = false — which KEEPS
     #      the client's cache_mode, so switching back on restores it
     #   3. the APP, per client, with the scalar cache_mode "off"
+    #   4. the APP sent no embedding model or key (an LLM-only client)
     # A cache_mode LIST (cascade) always means caching is ON.
     raw_cc = config.get("cache_config") or {}
     cache_enabled = raw_cc.get("enabled", True)
@@ -329,6 +330,7 @@ async def chat_completions(
         (cache_switch is not None and not cache_switch.enabled)
         or not cache_enabled
         or (isinstance(_cm, str) and _cm.lower() == "off")
+        or not (config.get("embed_model") and config.get("embed_api_key"))
     )
 
     # Cache only requests a cached plain answer can faithfully serve.

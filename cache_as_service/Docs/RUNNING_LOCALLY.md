@@ -52,7 +52,7 @@ SC_PG_DSN=postgresql://scuser:${POSTGRES_PASSWORD}@postgres:5432/sccache
 # ---- the APP's config endpoint ---------------------------------------------
 # A single fixed URL. We GET it presenting the CALLER'S OWN key as the bearer;
 # the APP identifies the client from that key and returns its models + keys.
-SC_APP_CONFIG_URL=http://host.docker.internal:8000/cache
+SC_APP_CONFIG_URL=http://host.docker.internal:8000/cache/key
 SC_APP_CONFIG_TTL=60
 
 # The SERVICE credential: proves to the APP that the caller is THIS SERVICE,
@@ -184,7 +184,7 @@ app = FastAPI()
 # value as SC_APP_SERVICE_KEY to see the real two-credential flow.
 SERVICE_KEY = os.environ.get("CACHE_SERVICE_KEY")
 
-@app.get("/cache")
+@app.get("/cache/key")
 async def cache_config(request: Request):
     # 1. WHO IS CALLING? The service key. Constant-time compare, not ==.
     if SERVICE_KEY:

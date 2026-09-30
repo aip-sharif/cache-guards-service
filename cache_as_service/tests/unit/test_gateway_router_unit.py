@@ -493,6 +493,14 @@ def test_app_can_switch_cache_off_per_client_with_enabled_false(env) -> None:
     assert env.pool.rows == []                       # pool never consulted
 
 
+def test_llm_only_client_without_embedding_is_a_passthrough(env) -> None:
+    """The APP wizard's default: chat model and key only, cache and guard off.
+    No embedding model means no cache, not a 502."""
+    env.app_config.default = dict(APP_CONFIG, embed_model=None, embed_api_key=None)
+    _assert_passthrough(env)
+    assert env.pool.rows == []
+
+
 def test_switching_back_on_keeps_the_clients_cache_mode(env) -> None:
     """Why `enabled` exists next to cache_mode "off": re-enabling must not
     lose which method the client had chosen."""

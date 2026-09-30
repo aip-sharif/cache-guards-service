@@ -9,7 +9,7 @@ OpenAI-compatible endpoint + semantic cache + message log).
 │  APP   │  1. mint key (APP's own concern) │ LLM service │
 │        │     hand sc-proj-… to the client │  (gateway)  │
 │        │                                  │             │
-│        │  3. GET /cache  (Bearer sc-proj) │             │
+│        │  3. GET /cache/key (sc-proj key) │             │
 │        │ ◀─────────────────────────────── │             │
 │        │ ───────────────────────────────▶ │             │
 │        │   model/embed/extractor + keys   │             │
@@ -82,11 +82,17 @@ it whenever we need a client's models — responses are cached in memory for
 ### Request (from the gateway)
 
 ```
-GET http://app-host:8000/cache
+GET http://app-host:8000/cache/key
 Authorization: Bearer sc-proj-3f8a1c…      # the CLIENT's own key, forwarded
 X-Service-Key: svc-…                       # proves the caller is US (§0)
 Accept: application/json
 ```
+
+Point it at `/cache/key`, the route that checks the service key — **not**
+`GET /cache`. That route answers on the client key alone, and the client key is
+the one handed to end users, so a leaked client key would return that client's
+provider credentials. Until `GET /cache` checks the service key too (or stops
+returning secrets), it must not be the config URL.
 
 The URL is used verbatim — there is no project id to substitute. The APP
 identifies the **client** from the bearer, and the **caller** from the service
@@ -134,7 +140,7 @@ the documented "no config for this key" case we already handle (§2, `Errors`).
 | Field | Required | Meaning |
 |---|---|---|
 | `model` + `model_api_key` | yes | Chat model slug + key, used against the mlops chat endpoint (`SC_LLM_BASE_URL`, gateway env). |
-| `embed_model` + `embed_api_key` | yes | Embedding model + key for the semantic cache (`SC_EMBED_BASE_URL`). |
+| `embed_model` + `embed_api_key` | no | Embedding model + key for the semantic cache (`SC_EMBED_BASE_URL`). Absent or empty → no cache for this client: every request is a passthrough, still logged. A guard then needs its own `guard.embed_model` + `guard.embed_api_key`. |
 | `extractor_model` + `extractor_api_key` | yes, nullable | Entity-extractor model + key (`SC_EXTRACTOR_BASE_URL`). `null` → entity-aware checking off. |
 | `extractor_domain` | when extractor set | `"medical"` or `"legal"`. |
 | `project_id` | optional (recommended) | Cache-isolation scope. Stable across key rotation, so a rotated key keeps the same cache. Omit it and the gateway scopes by a hash of the key instead (isolation still holds, but a new key = a fresh cache). |
@@ -625,7 +631,7 @@ missing**, never a bare 404.
 
 ```bash
 SC_PG_DSN=postgresql://…      # existing Postgres; only the `gw` schema is created
-SC_APP_CONFIG_URL=http://app-host:8000/cache   # §2, a single fixed URL
+SC_APP_CONFIG_URL=http://app-host:8000/cache/key   # §2, a single fixed URL
 SC_LLM_BASE_URL=https://…     # mlops chat endpoint
 SC_EMBED_BASE_URL=https://…   # mlops embeddings endpoint
 

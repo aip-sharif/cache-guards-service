@@ -6,7 +6,8 @@ a key: a client calls us with the key the APP gave it, and we turn around and
 ask the APP — presenting that same key — for six things:
 
     model            + model_api_key        (chat LLM on the mlops endpoint)
-    embed_model      + embed_api_key        (embedding model for the cache)
+    embed_model      + embed_api_key        (embedding model for the cache;
+                                             both absent → no cache, passthrough)
     extractor_model  + extractor_api_key    (entity extractor; null → unused)
 
 The mlops serving BASE URLS come from our own env (SC_LLM_BASE_URL,
@@ -72,8 +73,6 @@ from typing import Any, Dict, Optional, Tuple
 import httpx
 
 logger = logging.getLogger(__name__)
-
-_REQUIRED = ("model", "model_api_key", "embed_model", "embed_api_key")
 
 #: Default ceiling on cached configs. The cache is keyed by CLIENT KEY, so its
 #: size is chosen by our callers, not by us: an unbounded dict grows with every
@@ -259,10 +258,13 @@ class AppConfigClient:
             raw, "embedd_key", "embed_api_key", "embedding_key", "embedding_api_key"
         )
 
+        # Only the chat model is required. The embedding model feeds the cache
+        # (and the guard, by inheritance), and an LLM-only client - cache and
+        # guard off, the APP wizard's default - has none. Without both embed
+        # fields the router serves that client as a passthrough.
         missing = [
             name for name, value in (
                 ("llm_model", model), ("llm_key", model_key),
-                ("embedd_model", embed_model), ("embedd_key", embed_key),
             ) if not value
         ]
         if missing:
@@ -273,8 +275,8 @@ class AppConfigClient:
         return {
             "model": str(model),
             "model_api_key": str(model_key),
-            "embed_model": str(embed_model),
-            "embed_api_key": str(embed_key),
+            "embed_model": str(embed_model) if embed_model else None,
+            "embed_api_key": str(embed_key) if embed_key else None,
             "extractor_model": cls._pick(
                 raw, "extaractor", "extractor", "extractor_model"
             ),

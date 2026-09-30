@@ -208,7 +208,7 @@ The request loop — the key is the whole identity, there is no project id in:
 2. The client calls `POST /v1/chat/completions` with that key + a model (any
    OpenAI SDK works unchanged).
 3. We `GET {SC_APP_CONFIG_URL}` (a single fixed URL, e.g.
-   `http://app-host:8000/cache`) **forwarding the caller's own key** as the
+   `http://app-host:8000/cache/key`) **forwarding the caller's own key** as the
    bearer. The APP identifies the client and returns six things: **model,
    embedding model, entity extractor model (null → unused), and their three
    API keys** — plus an optional `project_id` (TTL-cached, `SC_APP_CONFIG_TTL`).
@@ -217,7 +217,7 @@ The request loop — the key is the whole identity, there is no project id in:
    (`SC_LLM_BASE_URL`) with the model+key from the APP, and the answer is
    cached on the way back.
 
-The APP contract we call — `GET /cache`, `Authorization: Bearer <the client's
+The APP contract we call — `GET /cache/key`, `Authorization: Bearer <the client's
 own key>`:
 
 ```json
@@ -285,7 +285,7 @@ a bare 404).
 | Variable | Required | What it is |
 |---|---|---|
 | `SC_PG_DSN` | yes | Ordinary Postgres connection string, `postgresql://user:pass@host:port/db`. Stores the message log and the cache backup. The DB must exist; only the `gw` schema is created. |
-| `SC_APP_CONFIG_URL` | yes | The APP's config endpoint — a single fixed URL, e.g. `http://app-host:8000/cache`. We GET it forwarding the caller's own key as the bearer. |
+| `SC_APP_CONFIG_URL` | yes | The APP's config endpoint — a single fixed URL, e.g. `http://app-host:8000/cache/key`. We GET it forwarding the caller's own key as the bearer. |
 | `SC_APP_CONFIG_TTL` | no (60) | Seconds a key's config is cached in memory. |
 | `SC_LLM_BASE_URL` | yes | MLOps chat endpoint; we POST `{url}/v1/chat/completions`. |
 | `SC_EMBED_BASE_URL` | yes | MLOps embeddings endpoint for the cache. |
