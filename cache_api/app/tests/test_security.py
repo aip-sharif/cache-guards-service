@@ -182,3 +182,64 @@ def test_disabled_cache_reaches_gateway_as_off():
     assert result.cache_config.cache_mode == "off"
     assert result.embed_model is None
     assert result.embed_api_key is None
+
+
+# ---------------------------------------------------------
+# review 29-sep F8/F9 - cache_config نامعتبر همون موقع register/edit رد می‌شه
+# ---------------------------------------------------------
+@pytest.mark.parametrize("cache_config", [
+    {"cache_mode": ["off", "exact"]},                 # F9: off داخل لیست
+    {"cache_mode": []},
+    {"cache_mode": "vector"},
+    {"fuzzy": {"distance": 0, "min_score": 0.5}},
+    {"fuzzy": {"distance": 4, "min_score": 0.5}},
+    {"semantic": {"similarity_threshold": 1.5}},
+    {"bm25": {"scorer": "NOPE", "min_score": 1.0}},
+])
+def test_invalid_cache_config_is_rejected(cache_config):
+    from pydantic import ValidationError
+    from app.models.schemas_cache import CacheModeConfigInput
+
+    with pytest.raises(ValidationError):
+        CacheModeConfigInput(**cache_config)
+
+
+def test_default_cache_mode_has_no_off():
+    from app.models.schemas_cache import CacheModeConfigInput
+
+    assert "off" not in CacheModeConfigInput().cache_mode
+
+
+def test_stored_cache_mode_with_off_is_normalized():
+    from app.routes.routes_cache import _normalize_cache_mode
+
+    assert _normalize_cache_mode(["off", "exact", "semantic"]) == ["exact", "semantic"]
+    assert _normalize_cache_mode(["off"]) == "off"
+    assert _normalize_cache_mode("bm25") == "bm25"
+
+
+# ---------------------------------------------------------
+# review 29-sep F5 - کلیدهای guard داخل JSON رمز می‌شن و به مرورگر ماسک‌شده می‌رسن
+# ---------------------------------------------------------
+def test_guard_secrets_are_encrypted_at_rest():
+    from app.utils.crypto_utils import SecretFieldsJSON
+
+    col = SecretFieldsJSON(("embed_api_key", "judge_api_key"))
+    stored = col.process_bind_param(
+        {"embed_api_key": "sk-guard", "judge_api_key": "sk-judge", "top_k": 8}, None
+    )
+    assert stored["embed_api_key"] != "sk-guard" and stored["judge_api_key"] != "sk-judge"
+    assert stored["top_k"] == 8
+    loaded = col.process_result_value(stored, None)
+    assert loaded == {"embed_api_key": "sk-guard", "judge_api_key": "sk-judge", "top_k": 8}
+    # مقدار plaintext قدیمی هنوز خونده می‌شه
+    assert col.process_result_value({"embed_api_key": "legacy"}, None) == {"embed_api_key": "legacy"}
+
+
+def test_secrets_are_masked_and_mask_means_keep():
+    from app.utils.crypto_utils import mask_secret, is_blank_or_masked
+
+    masked = mask_secret("sk-abcdefgh1234")
+    assert "abcdefgh" not in masked and masked.endswith("1234")
+    assert is_blank_or_masked(masked) and is_blank_or_masked("") and is_blank_or_masked("  ")
+    assert not is_blank_or_masked("sk-new-key")

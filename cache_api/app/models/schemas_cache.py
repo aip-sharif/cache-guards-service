@@ -119,12 +119,63 @@ class FuzzyConfig(BaseModel):
 
 class CacheModeConfig(BaseModel):
     """اختیاری - در صورت نبود، مقادیر پیش‌فرض استفاده می‌شن.
-    cache_mode می‌تونه یک رشته (یک متد) یا لیست (زنجیره) باشه."""
+    cache_mode می‌تونه یک رشته (یک متد) یا لیست (زنجیره) باشه.
+
+    این مدل عمداً سخت‌گیر نیست چون برای ساختن جواب از داده‌ی ذخیره‌شده هم
+    استفاده می‌شه؛ اعتبارسنجی ورودی توی CacheModeConfigInput پایینه."""
     enabled: bool = True
-    cache_mode: Union[str, List[str]] = ["off","exact", "bm25", "fuzzy", "semantic"]
+    # [F9 FIX] "off" از لیست پیش‌فرض حذف شد - gateway لیستِ دارای "off" رو رد می‌کنه
+    cache_mode: Union[str, List[str]] = ["exact", "bm25", "fuzzy", "semantic"]
     semantic: SemanticConfig = SemanticConfig()
     bm25: Bm25Config = Bm25Config()
     fuzzy: FuzzyConfig = FuzzyConfig()
+
+
+# ---------------------------------------------------------
+# [F8 FIX] همون قوانینی که gateway موقع chat اعمال می‌کنه
+# (cache_as_service/semantic_cache/core/config.py) - اینجا موقع
+# register/edit چک می‌شن تا 201 نده و بعد اولین chat با 502 شکست بخوره.
+# ---------------------------------------------------------
+CACHE_MODES = {"semantic", "bm25", "fuzzy", "exact", "off"}
+LEXICAL_SCORERS = {"BM25", "BM25STD", "TFIDF", "TFIDF.DOCNORM", "DISMAX", "DOCSCORE"}
+
+
+class CacheModeConfigInput(CacheModeConfig):
+    """cache_config ورودیِ register/edit - با اعتبارسنجی کامل"""
+
+    @model_validator(mode="after")
+    def _validate_against_gateway_rules(self):
+        errors = []
+
+        mode = self.cache_mode
+        if isinstance(mode, str):
+            if mode not in CACHE_MODES:
+                errors.append(f"cache_mode must be one of {sorted(CACHE_MODES)}, got {mode!r}")
+        else:
+            if not mode:
+                errors.append("cache_mode list must be non-empty")
+            bad = [m for m in mode if m not in CACHE_MODES]
+            if bad:
+                errors.append(f"unknown cache_mode value(s) {bad}; allowed: {sorted(CACHE_MODES)}")
+            if "off" in mode:
+                errors.append("cache_mode list cannot contain 'off' - use cache_mode='off' to disable caching")
+
+        threshold = self.semantic.similarity_threshold
+        if threshold is None or not 0.0 <= threshold <= 1.0:
+            errors.append("semantic.similarity_threshold must be between 0 and 1")
+
+        distance = self.fuzzy.distance
+        if distance is None or not 1 <= distance <= 3:
+            errors.append("fuzzy.distance must be between 1 and 3")
+
+        if self.bm25.scorer is None or self.bm25.scorer.strip().upper() not in LEXICAL_SCORERS:
+            errors.append(f"bm25.scorer must be one of {sorted(LEXICAL_SCORERS)}")
+        else:
+            self.bm25.scorer = self.bm25.scorer.strip().upper()
+
+        if errors:
+            raise ValueError("; ".join(errors))
+        return self
 
 
 class CacheRegister(BaseModel):
@@ -138,7 +189,7 @@ class CacheRegister(BaseModel):
     extaractor_key: Optional[str] = None
     extractor_domain: Optional[str] = None
     guard: Optional[GuardConfig] = None
-    cache_config: Optional[CacheModeConfig] = None
+    cache_config: Optional[CacheModeConfigInput] = None
 
 
 class CacheEdit(BaseModel):
@@ -151,7 +202,7 @@ class CacheEdit(BaseModel):
     extaractor_key: Optional[str] = None
     extractor_domain: Optional[str] = None
     guard: Optional[GuardConfig] = None
-    cache_config: Optional[CacheModeConfig] = None
+    cache_config: Optional[CacheModeConfigInput] = None
 
 
 class GatewayConfigResponse(BaseModel):

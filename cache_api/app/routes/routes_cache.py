@@ -21,6 +21,7 @@ from ..utils.db_utils import (
     update_cache_config,
 )
 from ..utils.guard_utils import resolve_guard
+from ..utils.crypto_utils import mask_secret, is_blank_or_masked
 from ..utils.guard_warmup import warmup_guard
 from ..utils.proxy_utils import forward_to_upstream
 from ..models.schemas_cache import (
@@ -40,6 +41,13 @@ router = APIRouter(prefix="/cache", tags=["cache"])
 
 _GUARD_ENABLED_POLICY_KEYS = {"enabled", "policy"}
 
+# [F5 FIX] کلیدهای provider داخل guard (هم‌خوان با GUARD_SECRET_KEYS در database.py)
+_GUARD_SECRET_KEYS = ("embed_api_key", "judge_api_key")
+
+# [F10 FIX] این فیلدها اگه توی edit خالی (یا ماسک‌شده) بیان یعنی «دست نزن»،
+# نه «پاکش کن» - فرم edit رمز رو خالی نشون می‌ده و قبلاً کلید رو با "" عوض می‌کرد
+_KEEP_IF_BLANK = {"llm_model", "llm_key", "embedd_model", "embedd_key", "extaractor_key"}
+
 
 def _guard_extra_fields(guard) -> dict:
     if guard is None:
@@ -53,6 +61,16 @@ def _cache_mode_is_off(mode) -> bool:
     if isinstance(mode, str):
         return mode.strip().lower() == "off"
     return bool(mode) and all(str(m).strip().lower() == "off" for m in mode)
+
+
+def _normalize_cache_mode(mode):
+    """[F9 FIX] ردیف‌های قدیمی با پیش‌فرضِ ["off", "exact", ...] ذخیره شدن که
+    gateway ردشون می‌کنه. "off" رو از لیست حذف می‌کنیم؛ لیستی که فقط "off"
+    داشت یعنی کش خاموش ("off")."""
+    if isinstance(mode, list) and any(str(m).strip().lower() == "off" for m in mode):
+        rest = [m for m in mode if str(m).strip().lower() != "off"]
+        return rest or "off"
+    return mode
 
 
 def _cache_is_on(cc) -> bool:
@@ -72,11 +90,21 @@ def _merge_guard(config, incoming: GuardConfig) -> GuardConfig:
             "policy": config.guard_policy,
             **(config.guard_config or {}),
         }
-    base.update(incoming.model_dump(exclude_unset=True))
+    incoming_data = incoming.model_dump(exclude_unset=True)
+    # [F5/F10 FIX] کلید ماسک‌شده (همونی که GET برگردونده) یا خالی = کلید قبلی بمونه
+    for key in _GUARD_SECRET_KEYS:
+        if is_blank_or_masked(incoming_data.get(key)):
+            incoming_data.pop(key, None)
+    base.update(incoming_data)
     return GuardConfig(**base)
 
 
-def _build_cache_read(cache, config) -> CacheRead:
+def _build_cache_read(cache, config, reveal_secrets: bool = False) -> CacheRead:
+    """
+    [F5 FIX] جواب‌هایی که به مرورگر می‌رن (register/edit/mine/read) کلیدهای
+    provider رو فقط ماسک‌شده (۴ کاراکتر آخر) دارن. reveal_secrets=True فقط
+    برای endpointهای سرویس‌به‌سرویس (با service key) استفاده می‌شه.
+    """
     data = cache.model_dump()
     guard = None
     cache_config = None
@@ -92,11 +120,18 @@ def _build_cache_read(cache, config) -> CacheRead:
             }
         cache_config = {
             "enabled": config.enabled,
-            "cache_mode": config.cache_mode,
+            "cache_mode": _normalize_cache_mode(config.cache_mode),
             "semantic": config.semantic,
             "bm25": config.bm25,
             "fuzzy": config.fuzzy,
         }
+    if not reveal_secrets:
+        for key in ("llm_key", "embedd_key", "extaractor_key"):
+            data[key] = mask_secret(data.get(key))
+        if guard:
+            for key in _GUARD_SECRET_KEYS:
+                if key in guard:
+                    guard[key] = mask_secret(guard[key])
     data["guard"] = guard
     data["cache_config"] = cache_config
     return CacheRead(**data)
@@ -106,7 +141,7 @@ def _build_gateway_config(cache, config) -> GatewayConfigResponse:
     # [F1 FIX] gateway فقط cache_mode رو می‌فهمه و فیلد enabled رو نمی‌خونه؛
     # پس کش خاموش باید به‌صورت cache_mode="off" (passthrough) بهش برسه.
     cache_on = bool(config.enabled) if config else True
-    cache_mode = config.cache_mode if config else ["exact", "bm25", "fuzzy", "semantic"]
+    cache_mode = _normalize_cache_mode(config.cache_mode) if config else ["exact", "bm25", "fuzzy", "semantic"]
     if not cache_on:
         cache_mode = "off"
 
@@ -162,6 +197,16 @@ async def register_cache(
 ):
     resolved_guard = resolve_guard(data.guard, id_user)  # می‌تونه HTTPException(502) بندازه
 
+    # [F12 FIX] guardی که با enabled=false فرستاده شده قبلاً کلاً دور ریخته می‌شد
+    # (resolve_guard براش None برمی‌گردونه). الان policy و تنظیماتش خاموش ذخیره
+    # می‌شن - مثل edit - تا بعداً فقط با {"enabled": true} روشن بشه.
+    if resolved_guard:
+        guard_to_store = resolved_guard
+    elif data.guard is not None and data.guard.enabled is False:
+        guard_to_store = data.guard
+    else:
+        guard_to_store = None
+
     # [F1 FIX] ثبت‌نام فقط-LLM: بدون مدل embedding، کش پیش‌فرض خاموش می‌شه
     # (به‌جای کلیدی که همون اول با 502 سمت gateway رد بشه). اگه کلاینت
     # صریحاً کش رو روشن خواسته ولی مدل embedding نداده، همین‌جا 400 می‌دیم.
@@ -207,8 +252,8 @@ async def register_cache(
             cache_id=cache.id,
             enabled=cache_enabled,
             guard_enabled=bool(resolved_guard.enabled) if resolved_guard else False,
-            guard_policy=resolved_guard.policy if resolved_guard else None,
-            guard_config=_guard_extra_fields(resolved_guard),
+            guard_policy=guard_to_store.policy if guard_to_store else None,
+            guard_config=_guard_extra_fields(guard_to_store),
             cache_mode=cc.cache_mode if cc else None,
             semantic=cc.semantic.model_dump() if cc else None,
             bm25=cc.bm25.model_dump() if cc else None,
@@ -273,6 +318,10 @@ def edit_cache(
                 )
 
         update_data = data.model_dump(exclude_unset=True, exclude={"guard", "cache_config"})
+        update_data = {
+            k: v for k, v in update_data.items()
+            if not (k in _KEEP_IF_BLANK and is_blank_or_masked(v))
+        }
 
         updated = update_cache(db=db, id=cache_id, id_user=id_user, data=update_data)
         if not updated:
@@ -372,7 +421,7 @@ def read_cache_by_key(
         raise HTTPException(status_code=404, detail="Cache not found")
  
     config = get_cache_config(db=db, cache_id=cache.id)
-    result = _build_cache_read(cache, config).model_dump()
+    result = _build_cache_read(cache, config, reveal_secrets=True).model_dump()
     result["status_code"] = 200
     result["message"] = "Cache fetched successfully"
     return result

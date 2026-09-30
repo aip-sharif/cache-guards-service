@@ -19,7 +19,7 @@ provider های واقعی رو لو بده.
 
 import os
 from cryptography.fernet import Fernet, InvalidToken
-from sqlalchemy.types import TypeDecorator, String
+from sqlalchemy.types import TypeDecorator, String, JSON
 
 _KEY = os.getenv("SC_DB_ENCRYPTION_KEY")
 if not _KEY:
@@ -58,3 +58,77 @@ class EncryptedString(TypeDecorator):
                 "(likely pre-encryption legacy data or wrong SC_DB_ENCRYPTION_KEY)"
             )
             return value
+
+
+# ---------------------------------------------------------
+# [F5 FIX] کلیدهای guard (embed_api_key / judge_api_key) داخل ستون JSON
+# guard_config ذخیره می‌شن و قبلاً plaintext بودن. این TypeDecorator فقط همون
+# کلیدهای مشخص‌شده رو داخل dict رمز می‌کنه (بقیه‌ی تنظیمات قابل‌خوندن می‌مونن).
+# مقدار رمزشده با پیشوند "fernet:" علامت می‌خوره تا مقدار قدیمیِ plaintext
+# (قبل از این تغییر) هنوز خونده بشه و در اولین ذخیره‌ی بعدی رمز بشه.
+# ---------------------------------------------------------
+_ENC_PREFIX = "fernet:"
+
+
+def encrypt_secret(value):
+    if not isinstance(value, str) or not value or value.startswith(_ENC_PREFIX):
+        return value
+    return _ENC_PREFIX + _fernet.encrypt(value.encode()).decode()
+
+
+def decrypt_secret(value):
+    if not isinstance(value, str) or not value.startswith(_ENC_PREFIX):
+        return value  # None، رشته‌ی خالی یا plaintext قدیمی
+    try:
+        return _fernet.decrypt(value[len(_ENC_PREFIX):].encode()).decode()
+    except InvalidToken:
+        import logging
+        logging.getLogger("crypto").warning(
+            "Failed to decrypt a stored JSON secret - returning as-is "
+            "(likely wrong SC_DB_ENCRYPTION_KEY)"
+        )
+        return value
+
+
+class SecretFieldsJSON(TypeDecorator):
+    """ستون JSON که کلیدهای secret_keys داخل dict رو encrypt-at-rest می‌کنه."""
+
+    impl = JSON
+    cache_ok = True
+
+    def __init__(self, secret_keys=(), *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.secret_keys = tuple(secret_keys)
+
+    def process_bind_param(self, value, dialect):
+        if not isinstance(value, dict):
+            return value
+        return {
+            k: (encrypt_secret(v) if k in self.secret_keys else v)
+            for k, v in value.items()
+        }
+
+    def process_result_value(self, value, dialect):
+        if not isinstance(value, dict):
+            return value
+        return {
+            k: (decrypt_secret(v) if k in self.secret_keys else v)
+            for k, v in value.items()
+        }
+
+
+# ---------------------------------------------------------
+# [F5 FIX] کلیدها دیگه کامل به مرورگر برنمی‌گردن - فقط ۴ کاراکتر آخر.
+# edit مقدار ماسک‌شده یا خالی رو «بدون تغییر» حساب می‌کنه (نه کلید جدید).
+# ---------------------------------------------------------
+MASK_PREFIX = "********"
+
+
+def mask_secret(value):
+    if not isinstance(value, str) or not value:
+        return value
+    return MASK_PREFIX + (value[-4:] if len(value) > 8 else "")
+
+
+def is_blank_or_masked(value) -> bool:
+    return isinstance(value, str) and (not value.strip() or value.startswith(MASK_PREFIX))
