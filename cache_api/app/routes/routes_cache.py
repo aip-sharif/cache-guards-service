@@ -21,7 +21,6 @@ from ..utils.db_utils import (
     update_cache_config,
 )
 from ..utils.guard_utils import resolve_guard
-from ..utils.crypto_utils import mask_secret, is_blank_or_masked
 from ..utils.guard_warmup import warmup_guard
 from ..utils.proxy_utils import forward_to_upstream
 from ..models.schemas_cache import (
@@ -41,12 +40,15 @@ router = APIRouter(prefix="/cache", tags=["cache"])
 
 _GUARD_ENABLED_POLICY_KEYS = {"enabled", "policy"}
 
-# [F5 FIX] کلیدهای provider داخل guard (هم‌خوان با GUARD_SECRET_KEYS در database.py)
 _GUARD_SECRET_KEYS = ("embed_api_key", "judge_api_key")
 
-# [F10 FIX] این فیلدها اگه توی edit خالی (یا ماسک‌شده) بیان یعنی «دست نزن»،
-# نه «پاکش کن» - فرم edit رمز رو خالی نشون می‌ده و قبلاً کلید رو با "" عوض می‌کرد
+# [F10 FIX] این فیلدها اگه توی edit خالی بیان یعنی «دست نزن»، نه «پاکش کن» -
+# فرم edit رمز رو خالی نشون می‌ده و قبلاً کلید رو با "" عوض می‌کرد
 _KEEP_IF_BLANK = {"llm_model", "llm_key", "embedd_model", "embedd_key", "extaractor_key"}
+
+
+def _is_blank(value) -> bool:
+    return isinstance(value, str) and not value.strip()
 
 
 def _guard_extra_fields(guard) -> dict:
@@ -91,20 +93,15 @@ def _merge_guard(config, incoming: GuardConfig) -> GuardConfig:
             **(config.guard_config or {}),
         }
     incoming_data = incoming.model_dump(exclude_unset=True)
-    # [F5/F10 FIX] کلید ماسک‌شده (همونی که GET برگردونده) یا خالی = کلید قبلی بمونه
+    # [F10 FIX] کلید خالی = کلید قبلی بمونه
     for key in _GUARD_SECRET_KEYS:
-        if is_blank_or_masked(incoming_data.get(key)):
+        if _is_blank(incoming_data.get(key)):
             incoming_data.pop(key, None)
     base.update(incoming_data)
     return GuardConfig(**base)
 
 
-def _build_cache_read(cache, config, reveal_secrets: bool = False) -> CacheRead:
-    """
-    [F5 FIX] جواب‌هایی که به مرورگر می‌رن (register/edit/mine/read) کلیدهای
-    provider رو فقط ماسک‌شده (۴ کاراکتر آخر) دارن. reveal_secrets=True فقط
-    برای endpointهای سرویس‌به‌سرویس (با service key) استفاده می‌شه.
-    """
+def _build_cache_read(cache, config) -> CacheRead:
     data = cache.model_dump()
     guard = None
     cache_config = None
@@ -125,13 +122,6 @@ def _build_cache_read(cache, config, reveal_secrets: bool = False) -> CacheRead:
             "bm25": config.bm25,
             "fuzzy": config.fuzzy,
         }
-    if not reveal_secrets:
-        for key in ("llm_key", "embedd_key", "extaractor_key"):
-            data[key] = mask_secret(data.get(key))
-        if guard:
-            for key in _GUARD_SECRET_KEYS:
-                if key in guard:
-                    guard[key] = mask_secret(guard[key])
     data["guard"] = guard
     data["cache_config"] = cache_config
     return CacheRead(**data)
@@ -320,7 +310,7 @@ def edit_cache(
         update_data = data.model_dump(exclude_unset=True, exclude={"guard", "cache_config"})
         update_data = {
             k: v for k, v in update_data.items()
-            if not (k in _KEEP_IF_BLANK and is_blank_or_masked(v))
+            if not (k in _KEEP_IF_BLANK and _is_blank(v))
         }
 
         updated = update_cache(db=db, id=cache_id, id_user=id_user, data=update_data)
@@ -421,7 +411,7 @@ def read_cache_by_key(
         raise HTTPException(status_code=404, detail="Cache not found")
  
     config = get_cache_config(db=db, cache_id=cache.id)
-    result = _build_cache_read(cache, config, reveal_secrets=True).model_dump()
+    result = _build_cache_read(cache, config).model_dump()
     result["status_code"] = 200
     result["message"] = "Cache fetched successfully"
     return result

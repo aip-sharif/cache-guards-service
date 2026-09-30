@@ -2,10 +2,8 @@ from sqlmodel import SQLModel, Field, Column, JSON
 from random import random
 from datetime import datetime, timezone
 from typing import List, Optional
-from ..utils.crypto_utils import EncryptedString, SecretFieldsJSON
+from ..utils.crypto_utils import EncryptedString
 
-# کلیدهای provider داخل guard_config که باید رمز بشن
-GUARD_SECRET_KEYS = ("embed_api_key", "judge_api_key")
 DEFAULT_CACHE_MODE = ["exact", "bm25", "fuzzy", "semantic"]
 
 def utc_now() -> datetime:
@@ -37,11 +35,7 @@ class Cache(SQLModel, table=True):
     project_id: str = Field(default=None, nullable=False, unique=True, index=True)
 
     extaractor: str = Field(default=None, nullable=True)
-    # [F5 FIX] قبلاً plaintext بود؛ مقدار قدیمی هنوز خونده می‌شه (fallback
-    # داخل EncryptedString) و در اولین ذخیره‌ی بعدی رمز می‌شه
-    extaractor_key: Optional[str] = Field(
-        default=None, sa_column=Column(EncryptedString, nullable=True)
-    )
+    extaractor_key: str = Field(default=None, nullable=True)
     extractor_domain: str = Field(default=None, nullable=True)
 
     created_at: datetime = Field(default_factory=utc_now, nullable=False)
@@ -55,10 +49,7 @@ class CacheConfig(SQLModel, table=True):
 
     guard_enabled: bool = Field(default=False, nullable=False)
     guard_policy: str = Field(default=None, nullable=True)
-    # [F5 FIX] embed_api_key / judge_api_key داخل این JSON رمز می‌شن
-    guard_config: dict = Field(
-        default_factory=dict, sa_column=Column(SecretFieldsJSON(GUARD_SECRET_KEYS))
-    )
+    guard_config: dict = Field(default_factory=dict, sa_column=Column(JSON))
 
     # [F9 FIX] پیش‌فرض قبلی "off" رو توی لیست داشت که gateway ردش می‌کنه
     cache_mode: object = Field(

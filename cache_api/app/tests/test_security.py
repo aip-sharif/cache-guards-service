@@ -218,28 +218,12 @@ def test_stored_cache_mode_with_off_is_normalized():
     assert _normalize_cache_mode("bm25") == "bm25"
 
 
+
 # ---------------------------------------------------------
-# review 29-sep F5 - کلیدهای guard داخل JSON رمز می‌شن و به مرورگر ماسک‌شده می‌رسن
+# review 29-sep F10 - کلید خالی توی edit یعنی «بدون تغییر»
 # ---------------------------------------------------------
-def test_guard_secrets_are_encrypted_at_rest():
-    from app.utils.crypto_utils import SecretFieldsJSON
+def test_blank_key_means_keep():
+    from app.routes.routes_cache import _is_blank
 
-    col = SecretFieldsJSON(("embed_api_key", "judge_api_key"))
-    stored = col.process_bind_param(
-        {"embed_api_key": "sk-guard", "judge_api_key": "sk-judge", "top_k": 8}, None
-    )
-    assert stored["embed_api_key"] != "sk-guard" and stored["judge_api_key"] != "sk-judge"
-    assert stored["top_k"] == 8
-    loaded = col.process_result_value(stored, None)
-    assert loaded == {"embed_api_key": "sk-guard", "judge_api_key": "sk-judge", "top_k": 8}
-    # مقدار plaintext قدیمی هنوز خونده می‌شه
-    assert col.process_result_value({"embed_api_key": "legacy"}, None) == {"embed_api_key": "legacy"}
-
-
-def test_secrets_are_masked_and_mask_means_keep():
-    from app.utils.crypto_utils import mask_secret, is_blank_or_masked
-
-    masked = mask_secret("sk-abcdefgh1234")
-    assert "abcdefgh" not in masked and masked.endswith("1234")
-    assert is_blank_or_masked(masked) and is_blank_or_masked("") and is_blank_or_masked("  ")
-    assert not is_blank_or_masked("sk-new-key")
+    assert _is_blank("") and _is_blank("   ")
+    assert not _is_blank("sk-new-key") and not _is_blank(None)

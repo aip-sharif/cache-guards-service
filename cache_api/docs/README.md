@@ -210,19 +210,12 @@ contained `off` are served with `off` removed.
 A guard sent with `"enabled": false` at register is stored switched off with its
 policy and settings, so it can later be turned on with just `{"enabled": true}`.
 
-### Provider keys
+### Editing keys
 
-`llm_key`, `embedd_key`, `extaractor_key`, `guard.embed_api_key` and
-`guard.judge_api_key` are encrypted at rest (`SC_DB_ENCRYPTION_KEY`). Values
-stored in plaintext before this change are still read and get encrypted the
-next time the row is saved.
-
-Responses that reach the browser (`register`, `edit`, `/mine`, `/{project_id}`)
-return these keys masked as `********` plus the last 4 characters. Only the
-service-authenticated endpoints (`GET /cache`, `GET /cache/key`) return real
-values. On edit, a key that is blank or still masked means "keep the stored
-key", so an edit form can show the masked value and send it back unchanged;
-send a new value to rotate a key. `cache_config.enabled` defaults to
+On edit, a blank `llm_key`, `embedd_key`, `extaractor_key`, `llm_model`,
+`embedd_model` (or a blank guard `embed_api_key`/`judge_api_key`) means "keep
+the stored value", so an edit form can leave the password fields empty. Send a
+new value to rotate a key. `cache_config.enabled` defaults to
 `true` if not sent - set it to `false` to fully disable caching for the project
 (equivalent to `cache_mode: "off"`, but independent of it). `cache_mode` can be
 a single string or a list. More samples (including error cases) are in
