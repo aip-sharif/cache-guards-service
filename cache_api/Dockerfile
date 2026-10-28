@@ -1,5 +1,6 @@
-FROM docker.abrha.net/python:3.10-slim
-#FROM python:3.10-slim
+# CI overrides this with python:3.10-slim (the mirror is not reachable from GitHub runners).
+ARG BASE_IMAGE=docker.abrha.net/python:3.10-slim
+FROM ${BASE_IMAGE}
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1

@@ -2,13 +2,16 @@ name: CI
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, devlop]
   pull_request:
-    branches: [main, develop]
+    branches: [main, devlop]
 
 jobs:
   lint-and-build:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cache_api
 
     steps:
       - name: Checkout code
@@ -23,7 +26,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('cache_api/requirements.txt') }}
           restore-keys: |
             ${{ runner.os }}-pip-
 
@@ -40,7 +43,7 @@ jobs:
         run: python -m compileall -q app main.py
 
       - name: Build Docker image
-        run: docker build -t caching-service:ci .
+        run: docker build --build-arg BASE_IMAGE=python:3.10-slim -t caching-service:ci .
 
   # اگه بعداً تست‌های واقعی (pytest) اضافه کردید، این job رو فعال کنید:
   # test:
