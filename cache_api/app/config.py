@@ -29,3 +29,24 @@ STATE_SECRET = os.getenv("STATE_SECRET")
 
 EXTERNAL_API_URL =os.getenv("EXTERNAL_API_URL")
 SC_GATEWAY_ADMIN_KEY = os.getenv("SC_GATEWAY_ADMIN_KEY")
+SC_LLM_BASE_URL=os.getenv("SC_LLM_BASE_URL")               
+# [F11 FIX] قبلاً اشتباهی از SC_LLM_BASE_URL خونده می‌شد، پس proxy/embeddings
+# به هاست chat می‌رفت. اگه SC_EMBED_BASE_URL ست نشده باشه، مثل قبل از هاست LLM
+# استفاده می‌شه تا deployهای فعلی نشکنن.
+SC_EMBED_BASE_URL = os.getenv("SC_EMBED_BASE_URL") or SC_LLM_BASE_URL
+
+SC_APP_SERVICE_KEY = os.getenv("SC_APP_SERVICE_KEY")
+SC_APP_SERVICE_KEY_HEADER = os.getenv("SC_APP_SERVICE_KEY_HEADER", "X-Service-Key")
+
+# ---------------------------------------------------------
+# Guard warmup -> بعد از register/edit یه درخواست به gateway می‌زنیم
+# تا ایندکس guard (امبدینگ exemplar های policy) همون‌جا ساخته بشه
+# ---------------------------------------------------------
+SC_GATEWAY_CHAT_URL = os.getenv(
+    "SC_GATEWAY_CHAT_URL", "http://localhost:8080/v1/chat/completions"
+)
+GUARD_WARMUP_ENABLED = os.getenv("GUARD_WARMUP_ENABLED", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+GUARD_WARMUP_PROMPT = os.getenv("GUARD_WARMUP_PROMPT", "Can you talk about my project?")
+GUARD_WARMUP_TIMEOUT = float(os.getenv("GUARD_WARMUP_TIMEOUT", "120"))

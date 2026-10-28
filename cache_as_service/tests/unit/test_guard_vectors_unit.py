@@ -15,6 +15,7 @@ from semantic_cache.gateway.guard_vectors import (
     GuardEmbedMalformed,
     GuardIndex,
     cosine,
+    request_embed_timeout,
 )
 
 BASE = "https://embed.example.com"
@@ -369,3 +370,79 @@ def test_nbytes_tracks_the_matrix_for_the_pool_budget() -> None:
 def test_cosine_is_zero_for_a_zero_vector_rather_than_nan() -> None:
     assert cosine(np.zeros(4), np.ones(4)) == 0.0
     assert cosine(np.ones(4), np.ones(4)) == pytest.approx(1.0)
+
+
+# --------------------------------------------------------------------------- #
+# Timeouts
+#
+# The guard has TWO embedding paths with deliberately different budgets: the
+# per-request query embed, which must fit inside SC_GUARD_TIMEOUT, and the
+# policy index build, which is shielded, server-owned and budgeted separately
+# by SC_GUARD_BUILD_TIMEOUT. They ran on one shared value, so the build could
+# never use its own budget and any endpoint slower than the request budget was
+# permanently unreachable.
+# --------------------------------------------------------------------------- #
+
+
+class TimeoutSpy:
+    """An http double that records the timeout each call was given."""
+
+    def __init__(self, raises: Exception = None) -> None:
+        self.timeouts = []
+        self.raises = raises
+
+    async def post(self, url, *, headers=None, json=None, timeout=None):
+        self.timeouts.append(timeout)
+        if self.raises is not None:
+            raise self.raises
+        items = [{"object": "embedding", "index": i, "embedding": _vector_for(t)}
+                 for i, t in enumerate(json["input"])]
+        return httpx.Response(200, json={"object": "list", "data": items},
+                              request=httpx.Request("POST", url))
+
+
+async def test_embed_uses_the_instance_timeout_by_default() -> None:
+    spy = TimeoutSpy()
+    await GuardEmbedder(spy, base_url=BASE, api_key="k", model="m",
+                        timeout=2.0).embed(["a"])
+    assert spy.timeouts == [2.0]
+
+
+async def test_embed_accepts_a_per_call_timeout_for_the_build_path() -> None:
+    """The build's budget is 60s while a request's is ~1.5s; one embedder
+    object serves both, so the budget must travel with the CALL."""
+    spy = TimeoutSpy()
+    embedder = GuardEmbedder(spy, base_url=BASE, api_key="k", model="m",
+                             timeout=1.5)
+    await embedder.embed(["a"], input_type="query")          # request path
+    await embedder.embed(["b"], timeout=60.0)                # build path
+    assert spy.timeouts == [1.5, 60.0]
+
+
+async def test_a_timeout_names_its_cause() -> None:
+    """httpx timeout exceptions stringify to '', so the operator got
+    'embedding request failed: ' with no cause at all."""
+    spy = TimeoutSpy(raises=httpx.ReadTimeout(""))
+    embedder = GuardEmbedder(spy, base_url=BASE, api_key="k", model="m",
+                             retries=0)
+    with pytest.raises(GuardEmbedError) as excinfo:
+        await embedder.embed(["a"])
+    assert "ReadTimeout" in str(excinfo.value)
+
+
+def test_the_request_embed_timeout_scales_with_the_guard_deadline() -> None:
+    """It used to be min(1.5, guard_timeout / 3) — an absolute ceiling that
+    made SC_GUARD_TIMEOUT inert, so an operator whose endpoint answered in
+    2s had no setting anywhere that could fix it."""
+    assert request_embed_timeout(30.0, "cascade") > request_embed_timeout(5.0, "cascade")
+    assert request_embed_timeout(60.0, "cascade") >= 15.0
+
+
+def test_embedding_only_reserves_nothing_for_a_judge_that_cannot_run() -> None:
+    assert (request_embed_timeout(5.0, "embedding-only")
+            > request_embed_timeout(5.0, "cascade"))
+    assert request_embed_timeout(5.0, "embedding-only") <= 5.0
+
+
+def test_the_request_embed_timeout_has_a_floor_for_tiny_deadlines() -> None:
+    assert request_embed_timeout(0.1, "cascade") >= 1.5

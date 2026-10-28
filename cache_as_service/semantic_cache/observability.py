@@ -15,6 +15,8 @@ import sys
 import time
 from typing import Any, Optional
 
+from semantic_cache.redaction import redact
+
 # LogRecord attributes that are intrinsic — anything else on the record is a
 # caller-supplied `extra` and gets promoted to a top-level JSON field.
 _STANDARD_ATTRS = frozenset(
@@ -35,16 +37,20 @@ class JsonLogFormatter(logging.Formatter):
             + f".{int(record.msecs):03d}Z",
             "level": record.levelname,
             "logger": record.name,
-            "message": record.getMessage(),
+            # Redacted HERE, at the one place every log line passes through.
+            # Asking each call site to remember is how the upstream error body
+            # came to be logged verbatim under a comment observing that
+            # providers echo API keys in it.
+            "message": redact(record.getMessage()),
         }
         # Promote caller-supplied `extra=` fields.
         for key, value in record.__dict__.items():
             if key not in _STANDARD_ATTRS and not key.startswith("_"):
-                payload[key] = value
+                payload[key] = redact(value)
         if record.exc_info:
-            payload["exception"] = self.formatException(record.exc_info)
+            payload["exception"] = redact(self.formatException(record.exc_info))
         if record.stack_info:
-            payload["stack"] = self.formatStack(record.stack_info)
+            payload["stack"] = redact(self.formatStack(record.stack_info))
         return json.dumps(payload, ensure_ascii=False, default=str)
 
 

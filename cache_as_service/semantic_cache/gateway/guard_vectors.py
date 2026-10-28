@@ -52,6 +52,55 @@ SENTINEL_TEXT = "semantic-cache guard index sentinel v1"
 _MAX_BATCH = 64
 _NORM_TOLERANCE = 1e-3
 
+#: Floor for the request-path embed timeout, so a very small SC_GUARD_TIMEOUT
+#: does not produce a budget no endpoint could ever meet. It is a FLOOR, never
+#: a ceiling — see request_embed_timeout.
+_MIN_REQUEST_TIMEOUT = 1.5
+
+#: Fraction of the whole-check deadline the query embed may spend when a judge
+#: might still have to run after it.
+_EMBED_SHARE_WITH_JUDGE = 1.0 / 3.0
+
+#: Never spend the entire deadline in one stage: leaving a sliver means the
+#: failure surfaces as a named "embed_unreachable" rather than as the outer
+#: deadline firing, which is the difference between a diagnosis and a shrug.
+_DEADLINE_MARGIN = 0.9
+
+
+def request_embed_timeout(guard_timeout: float, mode: str) -> float:
+    """HTTP timeout for the per-request query embed, from the check deadline.
+
+    ``GuardChecker`` already wraps every stage in one ``asyncio.timeout``, so
+    this per-call value is not the real bound. Its only job is to stop ONE
+    stage from consuming the budget the next stage needs — which means a mode
+    that can never invoke a judge has nothing to reserve for one and may use
+    (almost) the whole deadline.
+
+    This MUST scale with the deadline. It used to be
+    ``min(1.5, guard_timeout / 3)``, whose ``min`` made 1.5s an absolute
+    ceiling: raising SC_GUARD_TIMEOUT changed nothing, no other setting
+    touched this path, and so an endpoint that answered in, say, 2s was
+    permanently unreachable — reported as a connection timeout while curl
+    against the same URL succeeded, because curl has no such deadline.
+    """
+    share = (
+        guard_timeout
+        if mode == "embedding-only"
+        else guard_timeout * _EMBED_SHARE_WITH_JUDGE
+    )
+    return max(_MIN_REQUEST_TIMEOUT, share * _DEADLINE_MARGIN)
+
+
+def judge_timeout(guard_timeout: float) -> float:
+    """HTTP timeout for one judge call. Same reasoning, same former defect.
+
+    The judge was wired as ``min(3.0, guard_timeout)``, equally inert above a
+    deadline of 3s. It is the complement of the embed share, so the two stages
+    together fit the deadline they were derived from.
+    """
+    share = guard_timeout * (1.0 - _EMBED_SHARE_WITH_JUDGE)
+    return max(3.0, share * _DEADLINE_MARGIN)
+
 
 class GuardEmbedError(Exception):
     """The embedding endpoint could not be used."""
@@ -107,20 +156,36 @@ class GuardEmbedder:
         self.call_count = 0
 
     async def embed(
-        self, texts: Sequence[str], *, input_type: str = "document"
+        self,
+        texts: Sequence[str],
+        *,
+        input_type: str = "document",
+        timeout: Optional[float] = None,
     ) -> np.ndarray:
-        """Embeds ``texts`` and returns an ``(n, dim)`` float32 unit matrix."""
+        """Embeds ``texts`` and returns an ``(n, dim)`` float32 unit matrix.
+
+        ``timeout`` overrides the instance default for THIS call. The guard has
+        two embedding paths with deliberately different budgets — a request's
+        query embed, which must fit inside SC_GUARD_TIMEOUT, and a policy index
+        build, which is shielded, server-owned and budgeted by
+        SC_GUARD_BUILD_TIMEOUT because embedding a whole policy is slow. One
+        embedder object serves both, so the budget has to travel with the CALL.
+        Sharing the request's timeout made SC_GUARD_BUILD_TIMEOUT unreachable:
+        against any endpoint slower than one request's share, the build failed,
+        was retried by the next request, and failed again forever.
+        """
         if not texts:
             return np.zeros((0, 0), dtype=np.float32)
         prefix = self._query_prefix if input_type == "query" else self._doc_prefix
         prepared = [prefix + t for t in texts]
+        budget = self._timeout if timeout is None else timeout
 
         vectors: List[List[float]] = []
         size = 1 if self._one_at_a_time else self._batch_size
         index = 0
         while index < len(prepared):
             batch = prepared[index:index + size]
-            vectors.extend(await self._embed_batch(batch))
+            vectors.extend(await self._embed_batch(batch, budget))
             index += size
             if self._one_at_a_time:
                 size = 1
@@ -128,9 +193,11 @@ class GuardEmbedder:
         matrix = np.asarray(vectors, dtype=np.float32)
         return self._normalize(matrix)
 
-    async def _embed_batch(self, batch: Sequence[str]) -> List[List[float]]:
+    async def _embed_batch(
+        self, batch: Sequence[str], budget: float
+    ) -> List[List[float]]:
         try:
-            return await self._post(batch)
+            return await self._post(batch, budget)
         except GuardEmbedError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -144,18 +211,28 @@ class GuardEmbedder:
                 self._one_at_a_time = True
                 out: List[List[float]] = []
                 for text in batch:
-                    out.extend(await self._post([text]))
+                    out.extend(await self._post([text], budget))
                 return out
-            raise GuardEmbedError(f"embedding request failed: {type(e).__name__}: {e!r}") from e
+            # httpx's timeout exceptions stringify to the EMPTY STRING, so the
+            # bare {e} produced "embedding request failed: " — an operator
+            # staring at that cannot tell a timeout from a DNS failure from a
+            # refused connection, which is the whole diagnosis. Name the type,
+            # and name the budget that was exceeded.
+            raise GuardEmbedError(
+                f"embedding request to {self._url} failed after {budget:.2f}s "
+                f"({type(e).__name__}): {e}"
+            ) from e
 
-    async def _post(self, batch: Sequence[str]) -> List[List[float]]:
+    async def _post(
+        self, batch: Sequence[str], budget: float
+    ) -> List[List[float]]:
         async def _once() -> List[List[float]]:
             self.call_count += 1
             response = await self._http.post(
                 self._url,
                 headers={"Authorization": f"Bearer {self._api_key}"},
                 json={"input": list(batch), "model": self._model},
-                timeout=self._timeout,
+                timeout=budget,
             )
             response.raise_for_status()
             return _extract_vectors(response.json(), len(batch))
@@ -370,4 +447,6 @@ __all__ = [
     "GuardEmbedder",
     "GuardIndex",
     "cosine",
+    "judge_timeout",
+    "request_embed_timeout",
 ]

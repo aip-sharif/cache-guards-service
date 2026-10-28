@@ -24,7 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
 from semantic_cache.gateway.guard_config import GuardConfigError, ResolvedGuard
 from semantic_cache.gateway.guard_judge import (
@@ -50,7 +50,6 @@ from semantic_cache.gateway.guard_pool import (
 )
 from semantic_cache.gateway.guard_vectors import (
     GuardDimMismatch,
-    GuardEmbedder,
     GuardEmbedError,
 )
 
@@ -93,6 +92,9 @@ class GuardOutcome:
     judge_invoked: bool = False
     top_matches: List[Neighbor] = field(default_factory=list)
     latency_ms: Optional[int] = None
+    #: Human-readable cause. Only `config_invalid` sends it to the caller;
+    #: other reasons can carry internal detail and stay in our logs.
+    detail: str = ""
 
     @property
     def blocked(self) -> bool:
@@ -366,6 +368,7 @@ class GuardChecker:
             refusal=(
                 resolved.params.unavailable_refusal or DEFAULT_UNAVAILABLE_REFUSAL
             ),
+            detail=detail,
         )
 
 

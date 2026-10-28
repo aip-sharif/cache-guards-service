@@ -28,12 +28,7 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from semantic_cache.gateway.guard_config import (  # noqa: E402
-    GuardLimits,
-    derive_guard_config,
-)
-from semantic_cache.gateway.guard_logic import Segment  # noqa: E402
-from semantic_cache.gateway.guard_pool import GuardPool  # noqa: E402
+from semantic_cache.gateway.guard_config import derive_guard_config  # noqa: E402
 
 DEFAULT_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
@@ -47,7 +42,8 @@ class LocalEmbedder:
         self._model = SentenceTransformer(model_name)
         self.call_count = 0
 
-    async def embed(self, texts: Sequence[str], *, input_type: str = "document"):
+    async def embed(self, texts: Sequence[str], *, input_type: str = "document",
+                    timeout: float = None):
         self.call_count += 1
         vectors = self._model.encode(list(texts), normalize_embeddings=True)
         return np.ascontiguousarray(np.asarray(vectors), dtype=np.float32)

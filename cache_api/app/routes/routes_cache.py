@@ -1,15 +1,16 @@
 # routes_cache.py
 
-import uuid
-from fastapi import APIRouter, Depends, HTTPException
-from sqlmodel import Session
 import logging
+import uuid
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials
+from sqlmodel import Session
 
-logger = logging.getLogger("cache")
-
+from ..config import SC_EMBED_BASE_URL, SC_LLM_BASE_URL
 from ..utils.db_utils import (
     get_session,
     create_cache,
+    delete_cache,
     get_cache,
     get_cache_by_project_id,
     get_cache_by_key,
@@ -20,6 +21,8 @@ from ..utils.db_utils import (
     update_cache_config,
 )
 from ..utils.guard_utils import resolve_guard
+from ..utils.guard_warmup import warmup_guard
+from ..utils.proxy_utils import forward_to_upstream
 from ..models.schemas_cache import (
     CacheRegister,
     CacheEdit,
@@ -27,14 +30,25 @@ from ..models.schemas_cache import (
     APIResponse,
     GatewayConfigResponse,
     CacheModeConfig,
+    GuardConfig,
 )
-from ..auth import get_current_user_id, verify_gateway_admin_key
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from ..auth import bearer_scheme, get_current_user_id, verify_service_key
+
+logger = logging.getLogger("cache")
 
 router = APIRouter(prefix="/cache", tags=["cache"])
-project_key_scheme = HTTPBearer()
 
 _GUARD_ENABLED_POLICY_KEYS = {"enabled", "policy"}
+
+_GUARD_SECRET_KEYS = ("embed_api_key", "judge_api_key")
+
+# [F10 FIX] این فیلدها اگه توی edit خالی بیان یعنی «دست نزن»، نه «پاکش کن» -
+# فرم edit رمز رو خالی نشون می‌ده و قبلاً کلید رو با "" عوض می‌کرد
+_KEEP_IF_BLANK = {"llm_model", "llm_key", "embedd_model", "embedd_key", "extaractor_key"}
+
+
+def _is_blank(value) -> bool:
+    return isinstance(value, str) and not value.strip()
 
 
 def _guard_extra_fields(guard) -> dict:
@@ -44,19 +58,66 @@ def _guard_extra_fields(guard) -> dict:
     return {k: v for k, v in data.items() if k not in _GUARD_ENABLED_POLICY_KEYS}
 
 
+def _cache_mode_is_off(mode) -> bool:
+    """cache_mode = "off" (یا لیستی که فقط "off" داره) یعنی کش خاموشه."""
+    if isinstance(mode, str):
+        return mode.strip().lower() == "off"
+    return bool(mode) and all(str(m).strip().lower() == "off" for m in mode)
+
+
+def _normalize_cache_mode(mode):
+    """[F9 FIX] ردیف‌های قدیمی با پیش‌فرضِ ["off", "exact", ...] ذخیره شدن که
+    gateway ردشون می‌کنه. "off" رو از لیست حذف می‌کنیم؛ لیستی که فقط "off"
+    داشت یعنی کش خاموش ("off")."""
+    if isinstance(mode, list) and any(str(m).strip().lower() == "off" for m in mode):
+        rest = [m for m in mode if str(m).strip().lower() != "off"]
+        return rest or "off"
+    return mode
+
+
+def _cache_is_on(cc) -> bool:
+    return bool(cc.enabled) and not _cache_mode_is_off(cc.cache_mode)
+
+
+def _merge_guard(config, incoming: GuardConfig) -> GuardConfig:
+    """
+    guard ذخیره‌شده (enabled + policy + بقیه‌ی تنظیمات) رو پایه قرار می‌ده و
+    فقط فیلدهایی که کلاینت واقعاً فرستاده روش override می‌کنه - یعنی edit
+    جزئی: مثلاً فقط {"enabled": false} بقیه‌ی guard رو دست‌نخورده نگه می‌داره.
+    """
+    base = {}
+    if config:
+        base = {
+            "enabled": config.guard_enabled,
+            "policy": config.guard_policy,
+            **(config.guard_config or {}),
+        }
+    incoming_data = incoming.model_dump(exclude_unset=True)
+    # [F10 FIX] کلید خالی = کلید قبلی بمونه
+    for key in _GUARD_SECRET_KEYS:
+        if _is_blank(incoming_data.get(key)):
+            incoming_data.pop(key, None)
+    base.update(incoming_data)
+    return GuardConfig(**base)
+
+
 def _build_cache_read(cache, config) -> CacheRead:
     data = cache.model_dump()
     guard = None
     cache_config = None
     if config:
-        if config.guard_enabled:
+        # guard خاموش ولی تنظیم‌شده هم برگردونده می‌شه (با enabled=false)
+        # تا کاربر ببینه policy/تنظیماتش سر جاشه؛ gateway از _build_gateway_config
+        # می‌خونه که همچنان فقط guard روشن رو می‌فرسته.
+        if config.guard_enabled or config.guard_policy:
             guard = {
                 "enabled": config.guard_enabled,
                 "policy": config.guard_policy,
                 **(config.guard_config or {}),
             }
         cache_config = {
-            "cache_mode": config.cache_mode,
+            "enabled": config.enabled,
+            "cache_mode": _normalize_cache_mode(config.cache_mode),
             "semantic": config.semantic,
             "bm25": config.bm25,
             "fuzzy": config.fuzzy,
@@ -66,190 +127,13 @@ def _build_cache_read(cache, config) -> CacheRead:
     return CacheRead(**data)
 
 
-# ---------------------------------------------------------
-# 1) Register 
-# ---------------------------------------------------------
-@router.post("/register", response_model=APIResponse)
-async def register_cache(
-    data: CacheRegister,
-    db: Session = Depends(get_session),
-    id_user: str ="x" #Depends(get_current_user_id),
-):
-    try:
-        resolved_guard = resolve_guard(data.guard, id_user)
-
-        name = f"model_{uuid.uuid4().hex[:8]}"
-
-        project_id = uuid.uuid4().hex
-        api_key = f"sc-proj-{uuid.uuid4().hex}"
-
-        cache = create_cache(
-            db=db,
-            id_user=id_user,
-            name=name,
-            embedd_model=data.embedd_model,
-            embedd_key=data.embedd_key,
-            llm_model=data.llm_model,
-            llm_key=data.llm_key,
-            extaractor=data.extaractor,
-            extaractor_key=data.extaractor_key,
-            extractor_domain=data.extractor_domain,
-            cache_key=api_key,
-            project_id=project_id,
-        )
-
-        cc = data.cache_config
-        config = create_cache_config(
-            db=db,
-            cache_id=cache.id,
-            guard_enabled=bool(resolved_guard.enabled) if resolved_guard else False,
-            guard_policy=resolved_guard.policy if resolved_guard else None,
-            guard_config=_guard_extra_fields(resolved_guard),
-            cache_mode=cc.cache_mode if cc else None,
-            semantic=cc.semantic.model_dump() if cc else None,
-            bm25=cc.bm25.model_dump() if cc else None,
-            fuzzy=cc.fuzzy.model_dump() if cc else None,
-        )
-
-        return APIResponse(
-            status_code=201,
-            message="Cache registered successfully",
-            data={'api_key':api_key,
-                  'project_id': project_id} #_build_cache_read(cache, config),
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to register cache: {e}")
-
-
-@router.put("/{cache_id}", response_model=APIResponse)
-def edit_cache(
-    cache_id: str,
-    data: CacheEdit,
-    db: Session = Depends(get_session),
-    id_user: str ="x" #Depends(get_current_user_id),
-):
-    try:
-        update_data = data.model_dump(exclude_unset=True, exclude={"guard", "cache_config"})
-
-        updated = update_cache(db=db, id=cache_id, id_user=id_user, data=update_data)
-        if not updated:
-            raise HTTPException(status_code=404, detail="Cache not found")
-
-        config = get_cache_config(db=db, cache_id=cache_id)
-
-        config_update = {}
-        if "guard" in data.model_fields_set:
-            resolved_guard = resolve_guard(data.guard, id_user)
-            config_update["guard_enabled"] = bool(resolved_guard.enabled) if resolved_guard else False
-            config_update["guard_policy"] = resolved_guard.policy if resolved_guard else None
-            config_update["guard_config"] = _guard_extra_fields(resolved_guard)
-
-        if data.cache_config is not None:
-            config_update["cache_mode"] = data.cache_config.cache_mode
-            config_update["semantic"] = data.cache_config.semantic.model_dump()
-            config_update["bm25"] = data.cache_config.bm25.model_dump()
-            config_update["fuzzy"] = data.cache_config.fuzzy.model_dump()
-
-        if config_update and config:
-            config = update_cache_config(db=db, cache_id=cache_id, data=config_update)
-
-        return APIResponse(
-            status_code=200,
-            message="Cache updated successfully",
-            data=_build_cache_read(updated, config),
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to update cache: {e}")
-
-
-# ---------------------------------------------------------
-# 3) Read 
-# ---------------------------------------------------------
-@router.get("/key", response_model=None)
-def read_cache_by_api_key(
-    #cache_key: str,
-    db: Session = Depends(get_session),
-    id = Depends(verify_gateway_admin_key),
-    #id_user: str = Depends(get_current_user_id),
-):
-    logger.info("read_cache_by_api_key called with key=%s", id)
-    cache = get_cache_by_key(db=db, cache_key=id)
-    if not cache:
-        raise HTTPException(status_code=404, detail="Cache not found")
-    config = get_cache_config(db=db, cache_id=cache.id)
-    result = _build_cache_read(cache, config).model_dump()
-    result["status_code"] = 200
-    result["message"] = "Cache fetched successfully"
-    return result
-
-    # return APIResponse(
-    #     status_code=200,
-    #     message="Cache fetched successfully",
-    #     data=_build_cache_read(cache, config),
-    # )
-
-
-
-@router.get("/{project_id}", response_model=APIResponse)
-def read_cache(
-    project_id: str,
-    db: Session = Depends(get_session),
-    #id = Depends(verify_gateway_admin_key,)
-    #id_user: str = Depends(get_current_user_id),
-):
-    cache = get_cache_by_project_id(db=db, project_id=project_id)
-    if not cache:
-        raise HTTPException(status_code=404, detail="Cache not found")
-    config = get_cache_config(db=db, cache_id=cache.id)
-    return APIResponse(
-        status_code=200,
-        message="Cache fetched successfully",
-        data=_build_cache_read(cache, config),
-    )
-
-
-
-# ---------------------------------------------------------
-# 3ب) Read -> لیست همه‌ی کش‌های کاربر (خودِ ما، نه gateway)
-#     مسیر عمداً "/mine" هست تا با GET /cache که مخصوص
-#     gateway هست تصادم نداشته باشه (طبق APP_INTEGRATION.md §2)
-# ---------------------------------------------------------
-@router.get("/mine", response_model=APIResponse)
-def read_all_caches(
-    db: Session = Depends(get_session),
-    id_user: str ="x" #Depends(get_current_user_id),
-):
-    caches = list_caches(db=db, id_user=id_user)
-    results = []
-    for cache in caches:
-        config = get_cache_config(db=db, cache_id=cache.id)
-        results.append(_build_cache_read(cache, config))
-    return APIResponse(
-        status_code=200,
-        message=f"{len(results)} cache(s) fetched successfully",
-        data=results,
-    )
-
-
-# ---------------------------------------------------------
-# 4) Config endpoint -> این رو خودِ gateway صدا می‌زنه:
-#    GET /cache   (دقیقاً همین مسیر، طبق APP_INTEGRATION.md §2)
-#    Authorization: Bearer <client's own key> (نه ادمین‌کی)
-# ---------------------------------------------------------
-@router.get("", response_model=GatewayConfigResponse)
-def gateway_config(
-    db: Session = Depends(get_session),
-    credentials: HTTPAuthorizationCredentials = Depends(project_key_scheme),
-):
-    cache = get_cache_by_key(db=db, cache_key=credentials.credentials)
-    if not cache:
-        raise HTTPException(status_code=403, detail="invalid project key")
-
-    config = get_cache_config(db=db, cache_id=cache.id)
+def _build_gateway_config(cache, config) -> GatewayConfigResponse:
+    # [F1 FIX] gateway فقط cache_mode رو می‌فهمه و فیلد enabled رو نمی‌خونه؛
+    # پس کش خاموش باید به‌صورت cache_mode="off" (passthrough) بهش برسه.
+    cache_on = bool(config.enabled) if config else True
+    cache_mode = _normalize_cache_mode(config.cache_mode) if config else ["exact", "bm25", "fuzzy", "semantic"]
+    if not cache_on:
+        cache_mode = "off"
 
     guard_response = None
     if config and config.guard_enabled:
@@ -262,17 +146,371 @@ def gateway_config(
     return GatewayConfigResponse(
         model=cache.llm_model,
         model_api_key=cache.llm_key,
-        embed_model=cache.embedd_model,
-        embed_api_key=cache.embedd_key,
+        embed_model=cache.embedd_model or None,
+        embed_api_key=cache.embedd_key or None,
         extractor_model=cache.extaractor,
         extractor_api_key=cache.extaractor_key,
         extractor_domain=cache.extractor_domain,
         project_id=cache.project_id,
         cache_config=CacheModeConfig(
-            cache_mode=config.cache_mode if config else ["exact", "bm25", "fuzzy", "semantic"],
+            enabled=cache_on,
+            cache_mode=cache_mode,
             semantic=config.semantic if config else {"similarity_threshold": 0.92},
             bm25=config.bm25 if config else {"scorer": "BM25", "min_score": 1.0},
             fuzzy=config.fuzzy if config else {"distance": 2, "min_score": 0.5},
         ),
         guard=guard_response,
+    )
+
+
+# ===========================================================
+# ثابت‌ها اول ("/mine", "/key/{cache_key}") - قبل از "/{project_id}"
+# [A01 FIX] ترتیب رجیستر شدن مهمه: FastAPI مسیرها رو به ترتیب تعریف
+# چک می‌کنه، پس مسیر پارامتری {project_id} اگه زودتر بیاد هرچیزی
+# (از جمله "mine"/"key") رو به‌عنوان project_id می‌قاپه.
+# ===========================================================
+
+
+# ---------------------------------------------------------
+# 1) Register -> ساخت کش جدید (جدول cache) + تنظیمات (جدول cache_config)
+# [S01 FIX] id_user دوباره از Casdoor گرفته می‌شه (نه ثابت "x")
+# [A02 FIX] هر دو insert (cache + cache_config) داخل یه بلوک اتمیک -
+# اگه دومی خطا بده، اولی هم rollback می‌شه (رکورد یتیم نمی‌مونه)
+# [R05 FIX] پیام خطای داخلی (str(e)) دیگه مستقیم به کلاینت برنمی‌گرده
+# ---------------------------------------------------------
+@router.post("/register", response_model=APIResponse)
+async def register_cache(
+    data: CacheRegister,
+    background: BackgroundTasks,
+    db: Session = Depends(get_session),
+    id_user: str = Depends(get_current_user_id),
+):
+    resolved_guard = resolve_guard(data.guard, id_user)  # می‌تونه HTTPException(502) بندازه
+
+    # [F12 FIX] guardی که با enabled=false فرستاده شده قبلاً کلاً دور ریخته می‌شد
+    # (resolve_guard براش None برمی‌گردونه). الان policy و تنظیماتش خاموش ذخیره
+    # می‌شن - مثل edit - تا بعداً فقط با {"enabled": true} روشن بشه.
+    if resolved_guard:
+        guard_to_store = resolved_guard
+    elif data.guard is not None and data.guard.enabled is False:
+        guard_to_store = data.guard
+    else:
+        guard_to_store = None
+
+    # [F1 FIX] ثبت‌نام فقط-LLM: بدون مدل embedding، کش پیش‌فرض خاموش می‌شه
+    # (به‌جای کلیدی که همون اول با 502 سمت gateway رد بشه). اگه کلاینت
+    # صریحاً کش رو روشن خواسته ولی مدل embedding نداده، همین‌جا 400 می‌دیم.
+    cc = data.cache_config
+    has_embed = bool(data.embedd_model) and bool(data.embedd_key)
+    if cc is None:
+        cache_enabled = has_embed
+    else:
+        cache_enabled = cc.enabled
+        if _cache_is_on(cc) and not has_embed:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "embedd_model and embedd_key are required when caching is enabled "
+                    "(send cache_config.enabled=false for an LLM-only project)"
+                ),
+            )
+
+    name = f"model_{uuid.uuid4().hex[:8]}"
+    project_id = uuid.uuid4().hex
+    api_key = f"sc-proj-{uuid.uuid4().hex}"
+
+    try:
+        cache = create_cache(
+            db=db,
+            id_user=id_user,
+            name=name,
+            # ستون‌ها NOT NULL هستن؛ نبودِ مدل embedding = رشته‌ی خالی
+            embedd_model=data.embedd_model or "",
+            embedd_key=data.embedd_key or "",
+            llm_model=data.llm_model,
+            llm_key=data.llm_key,
+            extaractor=data.extaractor,
+            extaractor_key=data.extaractor_key,
+            extractor_domain=data.extractor_domain,
+            cache_key=api_key,
+            project_id=project_id,
+            commit=False,  # هنوز commit نکن - می‌خوایم با config یکجا باشه
+        )
+
+        config = create_cache_config(
+            db=db,
+            cache_id=cache.id,
+            enabled=cache_enabled,
+            guard_enabled=bool(resolved_guard.enabled) if resolved_guard else False,
+            guard_policy=guard_to_store.policy if guard_to_store else None,
+            guard_config=_guard_extra_fields(guard_to_store),
+            cache_mode=cc.cache_mode if cc else None,
+            semantic=cc.semantic.model_dump() if cc else None,
+            bm25=cc.bm25.model_dump() if cc else None,
+            fuzzy=cc.fuzzy.model_dump() if cc else None,
+            commit=False,
+        )
+
+        db.commit()  # هر دو با هم، یا هیچ‌کدوم
+        db.refresh(cache)
+        db.refresh(config)
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        logger.exception("register_cache failed for id_user=%s", id_user)
+        raise HTTPException(status_code=500, detail="Failed to register cache")
+
+    # [GUARD WARMUP] فقط وقتی guard واقعاً روشنه - بعد از commit، تا اگه
+    # gateway در دسترس نباشه رکورد ثبت‌شده دست‌نخورده بمونه.
+    # توکنِ Authorization همون cache_key (api_key) خودِ همین پروژه‌ست.
+    if resolved_guard:
+        background.add_task(warmup_guard, cache.cache_key, cache.llm_model)
+
+    return APIResponse(
+        status_code=201,
+        message="Cache registered successfully",
+        data=_build_cache_read(cache, config),
+    )
+
+
+# ---------------------------------------------------------
+# 2) Edit
+# [S01 FIX] id_user از Casdoor
+# ---------------------------------------------------------
+@router.put("/{cache_id}", response_model=APIResponse)
+def edit_cache(
+    cache_id: str,
+    data: CacheEdit,
+    background: BackgroundTasks,
+    db: Session = Depends(get_session),
+    id_user: str = Depends(get_current_user_id),
+):
+    try:
+        resolved_guard = None
+
+        # [F1 FIX] روشن کردن کش بدون مدل embedding (نه توی همین درخواست،
+        # نه ذخیره‌شده) = کلیدی که سمت gateway با 502 رد می‌شه؛ زودتر رد کن.
+        if data.cache_config is not None and _cache_is_on(data.cache_config):
+            current = get_cache(db=db, id=cache_id, id_user=id_user)
+            if current and not (
+                (data.embedd_model or current.embedd_model)
+                and (data.embedd_key or current.embedd_key)
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "embedd_model and embedd_key are required when caching is enabled "
+                        "(send cache_config.enabled=false for an LLM-only project)"
+                    ),
+                )
+
+        update_data = data.model_dump(exclude_unset=True, exclude={"guard", "cache_config"})
+        update_data = {
+            k: v for k, v in update_data.items()
+            if not (k in _KEEP_IF_BLANK and _is_blank(v))
+        }
+
+        updated = update_cache(db=db, id=cache_id, id_user=id_user, data=update_data)
+        if not updated:
+            raise HTTPException(status_code=404, detail="Cache not found")
+
+        config = get_cache_config(db=db, cache_id=cache_id)
+
+        config_update = {}
+        if "guard" in data.model_fields_set:
+            if data.guard is None:
+                # "guard": null -> خاموش کامل (رفتار قبلی)
+                config_update["guard_enabled"] = False
+                config_update["guard_config"] = {}
+            else:
+                merged = _merge_guard(config, data.guard)
+                if merged.enabled is False:
+                    # فقط خاموش کن - policy و تنظیمات قبلی حفظ می‌شن تا
+                    # بعداً با {"enabled": true} دوباره روشن بشه
+                    config_update["guard_enabled"] = False
+                    config_update["guard_policy"] = merged.policy
+                    config_update["guard_config"] = _guard_extra_fields(merged)
+                else:
+                    resolved_guard = resolve_guard(merged, id_user)
+                    config_update["guard_enabled"] = bool(resolved_guard.enabled) if resolved_guard else False
+                    config_update["guard_policy"] = resolved_guard.policy if resolved_guard else None
+                    config_update["guard_config"] = _guard_extra_fields(resolved_guard)
+
+        if data.cache_config is not None:
+            config_update["enabled"] = data.cache_config.enabled
+            config_update["cache_mode"] = data.cache_config.cache_mode
+            config_update["semantic"] = data.cache_config.semantic.model_dump()
+            config_update["bm25"] = data.cache_config.bm25.model_dump()
+            config_update["fuzzy"] = data.cache_config.fuzzy.model_dump()
+
+        if config_update and config:
+            config = update_cache_config(db=db, cache_id=cache_id, data=config_update)
+            # commit دوم (توی update_cache_config) آبجکت `updated` رو expire می‌کنه
+            # و model_dump() روش dict خالی برمی‌گردونه -> CacheRead با
+            # "Field required" خطا می‌داد. دوباره از دیتابیس می‌خونیمش.
+            db.refresh(updated)
+
+        # [GUARD WARMUP] فقط وقتی خودِ guard توی همین درخواست عوض شده و
+        # نتیجه‌اش «روشن» بوده - policy جدید یعنی ایندکس جدید، پس دوباره warm می‌کنیم.
+        if resolved_guard:
+            background.add_task(warmup_guard, updated.cache_key, updated.llm_model)
+
+        return APIResponse(
+            status_code=200,
+            message="Cache updated successfully",
+            data=_build_cache_read(updated, config),
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("edit_cache failed for cache_id=%s id_user=%s", cache_id, id_user)
+        raise HTTPException(status_code=500, detail="Failed to update cache")
+
+
+# ---------------------------------------------------------
+# 3آ) لیست کش‌های خودِ کاربر - مسیر ثابت "/mine"، قبل از "/{project_id}"
+# [S01 FIX] id_user از Casdoor
+# ---------------------------------------------------------
+@router.get("/mine", response_model=APIResponse)
+def read_all_caches(
+    db: Session = Depends(get_session),
+    id_user: str = Depends(get_current_user_id),
+):
+    caches = list_caches(db=db, id_user=id_user)
+    results = [
+        _build_cache_read(cache, get_cache_config(db=db, cache_id=cache.id))
+        for cache in caches
+    ]
+    return APIResponse(
+        status_code=200,
+        message=f"{len(results)} cache(s) fetched successfully",
+        data=results,
+    )
+
+
+# ---------------------------------------------------------
+# 3ب) پیدا کردن یک کش بر اساس cache_key - فقط برای ادمین/gateway
+# [S01 FIX] این دیگه بدون auth نیست - verify_gateway_admin_key اجباریه
+# [S05 FIX] دیگه مقدار خودِ کلید لاگ نمی‌شه
+# مسیر ثابت "/key/..."، قبل از "/{project_id}"
+# ---------------------------------------------------------
+@router.get("/key", response_model=None)
+def read_cache_by_key(
+    db: Session = Depends(get_session),
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    _service: str = Depends(verify_service_key),
+):
+    if not credentials:
+        raise HTTPException(status_code=401, detail="not_authenticated")
+ 
+    cache = get_cache_by_key(db=db, cache_key=credentials.credentials)
+    if not cache:
+        raise HTTPException(status_code=404, detail="Cache not found")
+ 
+    config = get_cache_config(db=db, cache_id=cache.id)
+    result = _build_cache_read(cache, config).model_dump()
+    result["status_code"] = 200
+    result["message"] = "Cache fetched successfully"
+    return result
+    # return APIResponse(
+    #     status_code=200,
+    #     message="Cache fetched successfully",
+    #     data=_build_cache_read(cache, config),
+    # )
+
+
+# ---------------------------------------------------------
+# 4) Read -> خواندن یک کش بر اساس project_id (فقط خودِ صاحبش)
+# [S01 FIX] id_user از Casdoor + چک مالکیت (get_cache_by_project_id
+# همون‌جا فیلتر id_user رو هم اعمال می‌کنه - کاربر دیگه نمی‌تونه
+# پروژه‌ی کاربر دیگه رو با حدس زدن project_id بخونه)
+# این مسیر پارامتری باید بعد از همه‌ی مسیرهای ثابت بالا تعریف بشه
+# ---------------------------------------------------------
+@router.get("/{project_id}", response_model=APIResponse)
+def read_cache(
+    project_id: str,
+    db: Session = Depends(get_session),
+    id_user: str = Depends(get_current_user_id),
+):
+    cache = get_cache_by_project_id(db=db, project_id=project_id, id_user=id_user)
+    if not cache:
+        raise HTTPException(status_code=404, detail="Cache not found")
+    config = get_cache_config(db=db, cache_id=cache.id)
+    return APIResponse(
+        status_code=200,
+        message="Cache fetched successfully",
+        data=_build_cache_read(cache, config),
+    )
+
+
+# ---------------------------------------------------------
+# 5) Config endpoint -> این رو خودِ gateway صدا می‌زنه:
+#    GET /cache (طبق AppConfigClient، URL ثابت، project_id توی
+#    مسیر نمی‌ره - شناسایی فقط از روی Authorization Bearer)
+# ---------------------------------------------------------
+@router.get("", response_model=None)
+def gateway_config(
+    # [F3 FIX] این endpoint کلیدهای provider رو برمی‌گردونه؛ کلید پروژه
+    # به کاربر نهایی داده می‌شه، پس به‌تنهایی کافی نیست - باید خودِ gateway
+    # با X-Service-Key (SC_APP_SERVICE_KEY) صدا بزنه. اول چک می‌شه تا
+    # بدون service key حتی معتبر بودن/نبودن کلید پروژه هم لو نره.
+    _service: str = Depends(verify_service_key),
+    db: Session = Depends(get_session),
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+):
+    if not credentials:
+        raise HTTPException(status_code=401, detail="not_authenticated")
+
+    cache = get_cache_by_key(db=db, cache_key=credentials.credentials)
+    if not cache:
+        raise HTTPException(status_code=403, detail="invalid project key")
+
+    config = get_cache_config(db=db, cache_id=cache.id)
+    return _build_gateway_config(cache, config)
+
+
+# ---------------------------------------------------------
+# 6) Proxy -> مستقیم به mlops endpoint خودِ همین پروژه فوروارد می‌کنه
+# ---------------------------------------------------------
+def _authenticate_project(db: Session, credentials: HTTPAuthorizationCredentials):
+    if not credentials:
+        raise HTTPException(status_code=401, detail="not_authenticated")
+    cache = get_cache_by_key(db=db, cache_key=credentials.credentials)
+    if not cache:
+        raise HTTPException(status_code=403, detail="invalid project key")
+    return cache
+
+
+@router.post("/proxy/chat/completions")
+async def proxy_chat_completions(
+    payload: dict = Body(...),
+    db: Session = Depends(get_session),
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+):
+    cache = _authenticate_project(db, credentials)
+    return await forward_to_upstream(
+        base_url=SC_LLM_BASE_URL,
+        path="/v1/chat/completions",
+        model=cache.llm_model,
+        api_key=cache.llm_key,
+        payload=payload,
+    )
+
+
+@router.post("/proxy/embeddings")
+async def proxy_embeddings(
+    payload: dict = Body(...),
+    db: Session = Depends(get_session),
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+):
+    cache = _authenticate_project(db, credentials)
+    return await forward_to_upstream(
+        base_url=SC_EMBED_BASE_URL,
+        path="/v1/embeddings",
+        model=cache.embedd_model,
+        api_key=cache.embedd_key,
+        payload=payload,
     )

@@ -61,6 +61,9 @@ class _NoOpMetric:
     def inc(self, *args, **kwargs) -> None:
         pass
 
+    def dec(self, *args, **kwargs) -> None:
+        pass
+
     def observe(self, *args, **kwargs) -> None:
         pass
 
@@ -78,6 +81,7 @@ try:
     from prometheus_client import (  # type: ignore
         CollectorRegistry,
         Counter,
+        Gauge,
         Histogram,
         generate_latest,
         CONTENT_TYPE_LATEST,
@@ -133,6 +137,28 @@ if _PROMETHEUS_AVAILABLE:
         registry=registry,
         buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0),
     )
+
+    # HTTP-level series. The `path` label is the ROUTE TEMPLATE
+    # ("/v1/caches/{cache_id}"), never the raw URL: a label whose cardinality
+    # follows user input turns a scrape into an outage.
+    http_requests_total = Counter(
+        "scache_http_requests_total",
+        "HTTP requests served, by route template and status class.",
+        labelnames=("method", "path", "status"),
+        registry=registry,
+    )
+    http_request_latency_seconds = Histogram(
+        "scache_http_request_latency_seconds",
+        "Wall-clock latency of HTTP requests, by route template.",
+        labelnames=("method", "path"),
+        registry=registry,
+        buckets=(0.005, 0.025, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0),
+    )
+    http_requests_in_flight = Gauge(
+        "scache_http_requests_in_flight",
+        "HTTP requests currently being served.",
+        registry=registry,
+    )
 else:
     registry = None  # type: ignore[assignment]
     lookups_total = _NoOpMetric()  # type: ignore[assignment]
@@ -141,6 +167,9 @@ else:
     extraction_cache_total = _NoOpMetric()  # type: ignore[assignment]
     extractor_latency_seconds = _NoOpMetric()  # type: ignore[assignment]
     search_latency_seconds = _NoOpMetric()  # type: ignore[assignment]
+    http_requests_total = _NoOpMetric()  # type: ignore[assignment]
+    http_request_latency_seconds = _NoOpMetric()  # type: ignore[assignment]
+    http_requests_in_flight = _NoOpMetric()  # type: ignore[assignment]
 
 
 def record_hit() -> None:

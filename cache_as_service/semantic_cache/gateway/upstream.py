@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, AsyncIterator, Dict, Optional
+from typing import Any, AsyncIterator, Dict
 
 import httpx
+
+from semantic_cache.redaction import redact_body
 
 
 logger = logging.getLogger(__name__)
@@ -43,7 +45,8 @@ def _chat_endpoint(base_url: str) -> str:
 
 
 def _error_detail(body: bytes) -> str:
-    """Upstream's own message — for LOGS ONLY, never for the client."""
+    """Upstream's own message — for LOGS ONLY, never for the client, and
+    redacted by `_upstream_error` before it gets there."""
     try:
         parsed = json.loads(body)
         return parsed.get("error", {}).get("message") or body.decode("utf-8", "replace")
@@ -52,9 +55,16 @@ def _error_detail(body: bytes) -> str:
 
 
 def _upstream_error(status_code: int, body: bytes) -> UpstreamError:
-    """Logs the upstream's detail, returns a client-safe error."""
+    """Logs the upstream's detail, returns a client-safe error.
+
+    The detail is REDACTED and TRUNCATED before it reaches the log. Providers
+    echo the API key back in error messages — this module's own comment said so
+    while logging the body verbatim anyway — and the body is attacker-
+    influenced content of unbounded length. The JSON formatter redacts again on
+    the way out; doing it here too keeps the guarantee local to the call site
+    that actually knows what this string is."""
     detail = _error_detail(body)
-    logger.error("Upstream error %s: %s", status_code, detail)
+    logger.error("Upstream error %s: %s", status_code, redact_body(detail))
     return UpstreamError(
         f"The upstream model provider returned an error (HTTP {status_code}).",
         status_code=status_code,

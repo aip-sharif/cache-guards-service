@@ -2,7 +2,6 @@
 
 import asyncio
 
-import pytest
 
 from semantic_cache.gateway.guard_log import GuardDecisionLog
 

@@ -51,7 +51,7 @@ class RedisClientFactory:
     def _create_standalone_client(config: SemanticCacheConfig) -> redis.Redis:
         logger.info("Connecting to standalone Redis at %s:%s", config.redis_host, config.redis_port)
         password = config.redis_password.get_secret_value() if config.redis_password else None
-        
+
         client = redis.Redis(
             host=config.redis_host,
             port=config.redis_port,
@@ -65,14 +65,14 @@ class RedisClientFactory:
     def _create_sentinel_client(config: SemanticCacheConfig) -> redis.Redis:
         logger.info("Connecting to Redis Sentinel. Sentinels: %s", config.redis_sentinels)
         sentinel_nodes: List[Tuple[str, int]] = []
-        
+
         if config.redis_sentinels:
             for node in config.redis_sentinels:
                 host, port = node.split(":")
                 sentinel_nodes.append((host, int(port)))
 
         password = config.redis_password.get_secret_value() if config.redis_password else None
-        
+
         sentinel = Sentinel(
             sentinel_nodes,
             sentinel_kwargs={"password": password} if password else None
@@ -91,7 +91,7 @@ class RedisClientFactory:
     def _create_cluster_client(config: SemanticCacheConfig) -> redis.Redis:
         logger.info("Connecting to Redis Cluster at %s:%s", config.redis_host, config.redis_port)
         password = config.redis_password.get_secret_value() if config.redis_password else None
-        
+
         client = RedisCluster(
             host=config.redis_host,
             port=config.redis_port,

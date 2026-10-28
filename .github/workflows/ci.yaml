@@ -2,13 +2,16 @@ name: CI
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, devlop]
   pull_request:
-    branches: [main, develop]
+    branches: [main, devlop]
 
 jobs:
   lint-and-build:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cache_api
 
     steps:
       - name: Checkout code
@@ -23,7 +26,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('cache_api/requirements.txt') }}
           restore-keys: |
             ${{ runner.os }}-pip-
 
@@ -40,7 +43,40 @@ jobs:
         run: python -m compileall -q app main.py
 
       - name: Build Docker image
-        run: docker build -t caching-service:ci .
+        run: docker build --build-arg BASE_IMAGE=python:3.10-slim -t caching-service:ci .
+
+  semantic-cache:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cache_as_service
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # Match the service image (python:3.12-slim in cache_as_service/Dockerfile).
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: cache_as_service/pyproject.toml
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ".[async,fastapi,postgres,metrics,translate,dev]" ruff
+
+      # Strict on purpose: pyproject.toml's [tool.ruff] is the rule set.
+      - name: Lint with ruff
+        run: ruff check .
+
+      - name: Unit tests
+        run: pytest
+
+      - name: Build Docker image
+        run: docker build -t semantic-cache:ci .
 
   # اگه بعداً تست‌های واقعی (pytest) اضافه کردید، این job رو فعال کنید:
   # test:

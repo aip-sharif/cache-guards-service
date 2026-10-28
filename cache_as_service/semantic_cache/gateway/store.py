@@ -124,6 +124,20 @@ class PostgresGatewayStore:
     def close(self) -> None:
         self.pool.close()
 
+    def ping(self, timeout: float = 2.0) -> bool:
+        """Round-trips a trivial query. For readiness probes.
+
+        Bounded by `timeout` so a Postgres that accepts connections and then
+        stalls reports down instead of hanging the probe — the pool's own wait
+        is otherwise unbounded, which would turn a slow database into a stuck
+        readiness endpoint."""
+        try:
+            with self.pool.connection(timeout=timeout) as conn:
+                conn.execute("SELECT 1")
+            return True
+        except Exception:  # noqa: BLE001 — any failure is "not ready"
+            return False
+
     def ensure_schema(self) -> None:
         with self.pool.connection() as conn:
             conn.execute(_SCHEMA_SQL)

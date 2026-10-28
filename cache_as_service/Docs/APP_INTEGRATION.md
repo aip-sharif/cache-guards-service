@@ -9,7 +9,7 @@ OpenAI-compatible endpoint + semantic cache + message log).
 │  APP   │  1. mint key (APP's own concern) │ LLM service │
 │        │     hand sc-proj-… to the client │  (gateway)  │
 │        │                                  │             │
-│        │  3. GET /cache  (Bearer sc-proj) │             │
+│        │  3. GET /cache/key (sc-proj key) │             │
 │        │ ◀─────────────────────────────── │             │
 │        │ ───────────────────────────────▶ │             │
 │        │   model/embed/extractor + keys   │             │
@@ -34,10 +34,34 @@ a standard OpenAI SDK (§3).
 | Credential | Who holds it | Where it comes from |
 |---|---|---|
 | **Client key** (`sc-proj-…`) | the APP + the client | **Minted by the APP** (any opaque string; `sc-proj-…` is just a convention). The APP hands it to the client and recognises it at the config endpoint. This service never mints or stores it. |
+| **Service key** (`SC_APP_SERVICE_KEY`) | the APP + this service, **nobody else** | A long-lived shared secret agreed once between the two of you. Sent on every config call in its own header. It never reaches a client. |
 | Model / embed / extractor API keys | the APP | The APP owns them and returns them in the config response (§2). The gateway never stores them (short in-memory TTL cache only). |
 
-There is no admin/service token: the gateway authenticates to the APP with
-**the client's own key**, the same key the client used to call us.
+### Two credentials, two different questions
+
+Every call we make to the APP's config endpoint carries both, and they are not
+interchangeable:
+
+| | Header | Answers | Who has seen it |
+|---|---|---|---|
+| **Client key** | `Authorization: Bearer …` | *Which client is this config for?* | the end user, their code, their logs |
+| **Service key** | `X-Service-Key: …` | *Is this the cache service asking?* | only the APP and this service |
+
+**Why the second one exists.** With the client key alone, your config endpoint
+is guarded by a credential you have handed to end users. Anyone who obtains a
+client key — from a browser, a CI log, a support ticket — can call your config
+endpoint directly and receive **that client's model-provider API keys**. The
+service key means a leaked client key is no longer sufficient on its own: the
+caller must also be us.
+
+It is deliberately **not** in `Authorization`; that header is already carrying
+the client's key, and collapsing two different claims into one header leaves
+the APP unable to tell them apart.
+
+**It is optional, so you can roll it out in either order.** Unset, nothing is
+sent and the contract is exactly as it was. Deploy this service with the key
+first, confirm your APP sees the header, then make the APP require it. The
+service logs a warning at boot whenever it is running without one.
 
 ---
 
@@ -58,13 +82,44 @@ it whenever we need a client's models — responses are cached in memory for
 ### Request (from the gateway)
 
 ```
-GET http://app-host:8000/cache
+GET http://app-host:8000/cache/key
 Authorization: Bearer sc-proj-3f8a1c…      # the CLIENT's own key, forwarded
+X-Service-Key: svc-…                       # proves the caller is US (§0)
 Accept: application/json
 ```
 
+Point it at `/cache/key`, the route that checks the service key — **not**
+`GET /cache`. That route answers on the client key alone, and the client key is
+the one handed to end users, so a leaked client key would return that client's
+provider credentials. Until `GET /cache` checks the service key too (or stops
+returning secrets), it must not be the config URL.
+
 The URL is used verbatim — there is no project id to substitute. The APP
-identifies the client from the bearer.
+identifies the **client** from the bearer, and the **caller** from the service
+key.
+
+`X-Service-Key` is present only when `SC_APP_SERVICE_KEY` is configured, and
+the header name is `SC_APP_SERVICE_KEY_HEADER` (default `X-Service-Key`) — pick
+whatever name suits the APP; no code change is needed on our side.
+
+**What the APP should do with it**, once you decide to require it:
+
+```python
+# The APP's config endpoint, sketched.
+SERVICE_KEY = os.environ["CACHE_SERVICE_KEY"]      # the same value we send
+
+if not hmac.compare_digest(request.headers.get("X-Service-Key", ""), SERVICE_KEY):
+    return JSONResponse({"error": "unknown caller"}, status_code=401)
+
+client = lookup_client_by_key(bearer_token(request))   # as before
+if client is None:
+    return JSONResponse({"error": "unknown key"}, status_code=403)
+```
+
+Use a constant-time comparison (`hmac.compare_digest`), not `==`. Distinguish
+the two failures in your own logs but not necessarily in the response: `401`
+for a bad service key is a caller problem, `403` for an unknown client key is
+the documented "no config for this key" case we already handle (§2, `Errors`).
 
 ### Response `200`
 
@@ -85,7 +140,7 @@ identifies the client from the bearer.
 | Field | Required | Meaning |
 |---|---|---|
 | `model` + `model_api_key` | yes | Chat model slug + key, used against the mlops chat endpoint (`SC_LLM_BASE_URL`, gateway env). |
-| `embed_model` + `embed_api_key` | yes | Embedding model + key for the semantic cache (`SC_EMBED_BASE_URL`). |
+| `embed_model` + `embed_api_key` | no | Embedding model + key for the semantic cache (`SC_EMBED_BASE_URL`). Absent or empty → no cache for this client: every request is a passthrough, still logged. A guard then needs its own `guard.embed_model` + `guard.embed_api_key`. |
 | `extractor_model` + `extractor_api_key` | yes, nullable | Entity-extractor model + key (`SC_EXTRACTOR_BASE_URL`). `null` → entity-aware checking off. |
 | `extractor_domain` | when extractor set | `"medical"` or `"legal"`. |
 | `project_id` | optional (recommended) | Cache-isolation scope. Stable across key rotation, so a rotated key keeps the same cache. Omit it and the gateway scopes by a hash of the key instead (isolation still holds, but a new key = a fresh cache). |
@@ -112,6 +167,21 @@ cascade):
 | `"fuzzy"` | Like `bm25`, but each token is matched within a Levenshtein distance (`fuzzy_distance`, 1–3), so typos still hit. Language-agnostic (works for Persian). | no | Traffic with typos / inconsistent spelling. |
 | `"exact"` | L0 exact-match **only** — one normalized-text (+scope) lookup. | no | Deterministic caching, zero false-hit risk, cheapest tier. |
 | `"off"` | Caching disabled — pure passthrough (still logged). Scalar only. | no | A client that must never be served a cached answer. |
+
+#### Turning a client's cache off and on again — `cache_config.enabled`
+
+```json
+"cache_config": {"enabled": false, "cache_mode": "bm25"}   // off, bm25 remembered
+"cache_config": {"enabled": true,  "cache_mode": "bm25"}   // back on, as bm25
+```
+
+`enabled` is the on/off switch; `cache_mode` stays whatever the client chose.
+That is the difference from `"cache_mode": "off"`, which *replaces* the method,
+so switching back on means remembering what it was. Omitted = `true`. A
+non-boolean (`"false"` as a string) is rejected with `502` rather than guessed.
+Stored entries are kept while off and served again once it is back on (their
+TTLs keep running). The guard is independent: `guard.enabled` controls it the
+same way (§2b), and turning one off never touches the other.
 
 **Single method (string).** The exact pre-check (`exact_tier`) is applied in
 front of it when enabled — so `"semantic"` with `exact_tier` on means "exact,
@@ -178,6 +248,9 @@ The APP's own field spellings are accepted as aliases: `llm_model`/`llm_key`,
 ---
 
 ## 2b. Guarding a client's input — `guard`
+
+> Implementing or maintaining the guard itself rather than integrating against
+> it? See `Docs/GUARD_HANDOFF.md`.
 
 The guard is a **second, independent module** beside the cache. It checks what
 the client sends against a policy *you* supply, and can refuse the request
@@ -325,6 +398,58 @@ within one config TTL. Changing the *policy text*, the embedding model, its key
 or the prefix style re-embeds every exemplar, billed to that client's embedding
 key.
 
+### When your examples do not fit your thresholds
+
+Before a policy serves traffic we score **every example against all the
+others** (leave-one-out) with the thresholds you sent. Each example must land
+on its own side:
+
+* an **allowed** example must score *below* `block_threshold`, or the policy
+  would refuse its own example of acceptable traffic;
+* a **disallowed** example must score *above* `allow_threshold`, or the policy
+  would let its own example of a violation through;
+* a **disallowed** example that scores exactly `0.000` means no other example
+  reached `min_similarity` at all — the floor is too high for your embedding
+  model, and that violation would be **allowed**.
+
+If any example fails, the request gets **`502`** and the message says what
+happened and what to change. It runs again **every time you change a
+threshold** (free: nothing is re-embedded), and on a policy change (after the
+re-embed). Example, real output:
+
+```
+Guard config from APP is invalid: guard.policy cannot separate its own
+examples with these thresholds (allow_threshold=0.4, block_threshold=0.85,
+min_similarity=0.99): 2 of 4 example(s) affected.
+1. disallowed example 'Is Rivalco better than you?': scores 0.000 because NO
+   exemplar cleared min_similarity … Fix: lower guard.min_similarity to 0.47
+   or below (the closest other example scored 0.47), or add more disallowed
+   examples that resemble this one.
+Start with min_similarity: while it discards every neighbour, no threshold
+can help.
+```
+
+What the message gives you:
+
+| Part | Meaning |
+|---|---|
+| first line | the thresholds we tested, and how many examples failed |
+| numbered lines (up to 5) | each failing example, its score, and a `Fix:` — the exact value to move a threshold past, or which example to reword |
+| `Thresholds that would pass this check: …` | a threshold pair that would make every example fit |
+| `But your examples overlap …` | that pair exists, but only with a wide ambiguous band: an allowed example scores higher than a disallowed one. **Change the examples** — reword the allowed one, or add clearer disallowed ones |
+| `Start with min_similarity …` | fix the floor first; until then no threshold can help |
+
+Two rules the fix must respect:
+
+* **Thresholds or examples — you choose.** Moving a threshold is instant and
+  free. Changing examples re-embeds the policy. When the message reports
+  overlap, change the examples.
+* **This error is never degraded to unguarded**, even with
+  `degrade_to_unguarded: true`. That flag covers outages (embedder or judge
+  down). A policy that cannot separate its own examples is a config error, and
+  switching a misconfigured guard off in silence is the failure a loud error
+  prevents.
+
 ### What gets checked — `check_roles`
 
 Default `["user", "system", "tool"]`. Whichever you choose, **every** message
@@ -428,6 +553,7 @@ that should be decided.
 | `401` / `403` / `404` (key unknown / no config) | `403` "The APP has no model config for this key." |
 | `5xx`, invalid JSON, missing required fields, unreachable | `502` |
 | a `guard` block we cannot use (unknown field, bad policy, missing switch) | `502` + `Retry-After: 30`, message naming the problem |
+| a guard whose examples do not fit its thresholds | `502` + `Retry-After: 30`, message naming each failing example and what to change — see "When your examples do not fit your thresholds". Never degraded. |
 | a usable guard that cannot RUN (embedder or judge down) | `503` + `Retry-After: 5` — or served unguarded if that client set `degrade_to_unguarded` |
 
 Notes for the APP implementer:
@@ -471,21 +597,176 @@ client.models.list()    # the client's model, as told by the APP
 
 ---
 
-## 4. Gateway env recap (operator side)
+## 4. Operator setup — from zero to serving
+
+Everything above is the APP's side of the contract. This section is the
+service's side: what an operator must set, in the order they must set it.
+
+[RUNNING_LOCALLY.md](RUNNING_LOCALLY.md) is the same path with a stub APP and
+`curl` output at each step. Use that if you want to see it work before you wire
+the real APP.
+
+### 4.1 Three secrets, first, or nothing starts
 
 ```bash
-SC_PG_DSN=postgresql://…      # existing Postgres; `gw` schema auto-created
-SC_APP_CONFIG_URL=http://app-host:8000/cache   # §2, a single fixed URL
-SC_APP_CONFIG_TTL=60
+python -c "import secrets; print('REDIS_PASSWORD=' + secrets.token_urlsafe(32))"
+python -c "import secrets; print('POSTGRES_PASSWORD=' + secrets.token_urlsafe(32))"
+python -c "import secrets; print('SC_API_KEY_PEPPER=' + secrets.token_urlsafe(48))"
+```
+
+Put them in `.env`. `docker compose` **refuses to start** without them, on
+purpose: the previous defaults were `scuser`/`scpass`, a real credential
+printed in this repository, on a published port.
+
+`SC_API_KEY_PEPPER` is the one to be careful with. Every stored API-key
+fingerprint is computed under it, so **changing it later logs every tenant
+out**. Treat it like a database encryption key: back it up, never rotate it
+casually. The other two rotate normally.
+
+### 4.2 The four variables that decide whether `/v1` serves at all
+
+The gateway has ONE surface — `/v1/*` serving — and it needs all four. Until
+they are set, `/v1/*` answers `503` **naming the exact variable that is
+missing**, never a bare 404.
+
+```bash
+SC_PG_DSN=postgresql://…      # existing Postgres; only the `gw` schema is created
+SC_APP_CONFIG_URL=http://app-host:8000/cache/key   # §2, a single fixed URL
 SC_LLM_BASE_URL=https://…     # mlops chat endpoint
 SC_EMBED_BASE_URL=https://…   # mlops embeddings endpoint
-SC_EXTRACTOR_BASE_URL=https://…  # optional
 
-# Input guard — ALL OPTIONAL. None of these is required and none affects
-# whether /v1 mounts: whether a client is guarded comes entirely from the APP.
+SC_APP_CONFIG_TTL=60          # optional: seconds a key's config is cached
+SC_EXTRACTOR_BASE_URL=https://…   # optional: only if the APP returns an extractor
+```
+
+**And the service credential** — how the APP knows the caller is us, not
+someone replaying a client key (§0):
+
+```bash
+# Generate once, share with the APP, put it in BOTH environments:
+#   python -c "import secrets; print(secrets.token_urlsafe(48))"
+SC_APP_SERVICE_KEY=svc-…
+SC_APP_SERVICE_KEY_HEADER=X-Service-Key   # optional; whatever name the APP wants
+```
+
+Optional in the sense that the service boots and serves without it — **not** in
+the sense that you should skip it. Without it, a leaked client key is enough to
+pull that client's model-provider credentials straight out of the APP. The
+service logs a warning at boot when it is unset.
+
+There is **no key-admin surface**. The APP mints keys; this service never does.
+
+### 4.3 Authentication for the SaaS API (`/v1/caches/*`)
+
+Key management lives at `GET/DELETE /v1/tenant/keys[/{key_id}]` and
+`GET/POST/DELETE /v1/caches/{id}/keys[/{key_id}]`. Keys are listed by `key_id`
+and display prefix — never key material and never a fingerprint, since a
+fingerprint is a verifier for the key. `POST .../keys?expires_in=<seconds>`
+issues one that expires; `POST .../rotate?grace=<seconds>` keeps the old keys
+working while callers redeploy.
+
+
+Separate from the gateway, and easy to get wrong because the failure is silent
+in one direction and loud in the other.
+
+```bash
+# Gates the SaaS admin routes (tenant creation) AND GET /metrics.
+# Unset → both answer 503.
+SC_ADMIN_API_KEY=sc-…
+
+# SSO. A verified JWT AUTO-PROVISIONS a tenant, so this is a tenant-creation
+# control, not just a login one. Unset → JWT bearers are REJECTED and only
+# minted sc-... keys authenticate. The server logs a warning at boot.
+SC_SSO_JWKS_URL=https://sso.example.com/.well-known/jwks.json   # RS/ES/PS/Ed
+SC_SSO_ALGORITHMS=["RS256"]
+# ...or, for a shared secret (verified in-process, no extra dependency):
+# SC_SSO_SHARED_SECRET=<long random string>
+# SC_SSO_ALGORITHMS=["HS256"]
+
+SC_SSO_ISSUER=https://sso.example.com
+SC_SSO_AUDIENCE=semantic-cache   # SET THIS whenever your SSO serves more than
+                                 # this service — otherwise a token minted for
+                                 # another app is accepted here
+SC_SSO_LEEWAY=60
+SC_SSO_JWKS_TTL=300
+```
+
+Three behaviours worth knowing before you debug them at 3am:
+
+* Naming an algorithm you have no key for — `HS256` with no shared secret,
+  `RS256` with no JWKS URL — is a **fatal startup error**. A service that boots
+  green while rejecting every login is worse than one that refuses to boot.
+* The algorithm allowlist is enforced **before** a key is chosen, so
+  alg-confusion and `alg: none` are unreachable.
+* Tokens with no `exp` are refused. A bearer credential that never expires is
+  not one this service will hold.
+
+### 4.4 Limits and probes
+
+```bash
+SC_MAX_REQUEST_BYTES=1048576   # request-body ceiling, enforced on the STREAM
+                               # (a chunked body carries no Content-Length).
+                               # 1 MiB ≈ a 250k-token chat body. 0 disables.
+SC_APP_CONFIG_MAX_ENTRIES=10000  # ceiling on cached per-key APP configs. The
+                               # cache is keyed by the CALLER's key, so without
+                               # a bound its size is chosen by your callers.
+SC_READINESS_TIMEOUT=2.0       # per-dependency deadline for /ready. Keep it
+                               # well under your probe interval.
+```
+
+Wire the probes the right way round — this is the single most common
+misconfiguration here:
+
+| Endpoint | Meaning | Your orchestrator should | Checks |
+|---|---|---|---|
+| `GET /health` | **Liveness** — the process is running | restart the container on failure | nothing external, deliberately |
+| `GET /ready` | **Readiness** — this replica can serve | stop sending traffic on failure | Redis, Postgres, the APP config endpoint (required); LLM + embed endpoints (reported, non-gating) |
+
+`/health` checks nothing external *because* it drives restarts: restarting a
+healthy process does not bring Redis back, it adds an outage to an outage.
+`/ready` returns `503` with a per-dependency breakdown, so you can see which
+dependency to chase rather than only that something is wrong.
+
+Every readiness probe is bounded and they run concurrently — a dependency that
+hangs is reported `"timeout"`, never awaited.
+
+### 4.5 Observability
+
+```bash
+SC_LOG_LEVEL=INFO
+SC_ENVIRONMENT=production
+SC_SENTRY_DSN=                        # optional
+SC_SENTRY_TRACES_SAMPLE_RATE=0.0      # tracing is OFF by default
+```
+
+`GET /metrics` serves Prometheus text exposition **behind
+`SC_ADMIN_API_KEY`** — exposition leaks route templates, traffic shape and
+error rates, which on a multi-tenant service is not public. With no admin key
+it answers `503`, never an empty `200`, so "I forgot the key" cannot look like
+"there are no metrics".
+
+Point Prometheus at it with the admin key as a bearer. Series include request
+count, latency and in-flight, labelled by **route template** (`/v1/caches/{cache_id}`),
+never by raw URL.
+
+Logs are one JSON object per line on stdout, and are **redacted centrally** by
+the formatter — bearer values, `api_key`-style fields, JWTs and DSN passwords
+are masked on the way out, so a call site cannot leak a secret by forgetting to
+think about it.
+
+### 4.6 Input guard — all optional
+
+None of these is required and none affects whether `/v1` mounts. Whether a
+client is guarded comes entirely from the APP (§2b).
+
+```bash
 SC_GUARD_ENABLED=true            # operator break-glass for every client
-SC_GUARD_TIMEOUT=5.0             # whole-check deadline, seconds
-SC_GUARD_BUILD_TIMEOUT=60.0      # deadline for embedding a policy
+SC_GUARD_TIMEOUT=5.0             # whole-check deadline, seconds. RAISE THIS if
+                                 # your embedding endpoint is slow on the
+                                 # request path — the per-stage HTTP timeouts
+                                 # are derived from it.
+SC_GUARD_BUILD_TIMEOUT=60.0      # deadline for embedding a policy; NOT limited
+                                 # by SC_GUARD_TIMEOUT
 SC_GUARD_MAX_EXEMPLARS=5000
 SC_GUARD_MAX_POLICY_BYTES=262144
 SC_GUARD_CACHE_MAX_BYTES=268435456
@@ -498,7 +779,136 @@ SC_GUARD_JUDGE_BASE_URL=         # defaults to SC_LLM_BASE_URL
 guard off for every client at runtime, with no redeploy — the break-glass for
 an incident where a fail-closed guard is refusing traffic.
 
-The gateway has one surface — `/v1/*` serving — enabled once all of
-`SC_PG_DSN`, `SC_APP_CONFIG_URL`, `SC_LLM_BASE_URL` and `SC_EMBED_BASE_URL`
-are set. Until then `/v1/*` answers `503` naming what is missing. There is no
-key-admin surface: the APP mints keys.
+### 4.6b Cache on/off — for every client
+
+```bash
+SC_CACHE_ENABLED=true            # false → every request is a passthrough
+```
+
+`POST /admin/cache {"enabled": false}` (bearer `SC_ADMIN_API_KEY`) does the
+same at runtime, no redeploy. Use it when the cache is up but wrong — stale
+answers, a bad threshold, an incident you want to rule the cache out of.
+Entries are kept, not purged; `{"enabled": true}` resumes serving them.
+
+`GET /admin/cache` and `GET /admin/guard` (same bearer) return the current
+`{"enabled": …}` of the replica that answers.
+
+Both switches, cache and guard, work the same way at two levels:
+
+| Level | Cache | Guard |
+|---|---|---|
+| One client (the APP decides) | `cache_config.enabled: false` | `guard.enabled: false` |
+| Every client (the operator decides) | `SC_CACHE_ENABLED` / `POST /admin/cache` | `SC_GUARD_ENABLED` / `POST /admin/guard` |
+
+**The `/admin/*` switches are per process.** A `POST` flips the one replica
+that receives it, and a restart reverts it to the env value. With more than one
+replica, set the env var and restart — that is the fleet-wide lever.
+
+### 4.7 Deploy
+
+```bash
+# Production — the BASE FILE ALONE. Data stores stay on the compose network.
+docker compose -f docker-compose.yml up -d
+
+# Local development — base + docker-compose.override.yml, which Compose loads
+# automatically. The override publishes Redis and Postgres to your host.
+docker compose up -d --build
+```
+
+That split is the whole point: publishing your data stores is right on a laptop
+and wrong on a server, and a single file could not tell the two apart — so the
+laptop settings shipped. **Do not deploy with the override file present.**
+
+The image runs as a non-root user with a `HEALTHCHECK`, one uvicorn worker, and
+a bounded graceful shutdown. One worker is deliberate: the guard's exemplar
+matrices, its segment memo and the APP-config cache are all per-process, so N
+workers means N copies of every matrix and N cold builds. **Scale with
+replicas, not workers**, and size the container for one process.
+
+### 4.8 Verify the install
+
+```bash
+curl -s localhost:8080/health                       # {"status":"ok"}
+curl -s localhost:8080/ready                        # per-dependency breakdown
+curl -s localhost:8080/metrics -H "Authorization: Bearer $SC_ADMIN_API_KEY" | head
+
+# Gateway, as a client would call it, with an APP-minted key:
+curl -s localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer sc-proj-…" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-x","messages":[{"role":"user","content":"hello"}]}'
+```
+
+A `503` from `/v1/*` names the missing variable. A `403` means the APP does not
+recognise that key. Both are in the troubleshooting table in
+[RUNNING_LOCALLY.md](RUNNING_LOCALLY.md).
+
+---
+
+## 5. Complete environment reference
+
+Required-ness is about **this service booting and serving**, not about whether
+a feature is good to have.
+
+| Variable | Required | Default | What it does |
+|---|---|---|---|
+| `REDIS_PASSWORD` | **yes** (compose) | — | Redis auth. Compose refuses to start without it. |
+| `POSTGRES_PASSWORD` | **yes** (compose) | — | Bundled-Postgres password. Compose refuses to start without it. |
+| `SC_API_KEY_PEPPER` | **yes** (compose) | — | Pepper for API-key fingerprints. **Never change it once you have live keys.** |
+| `SC_PG_DSN` | for `/v1` | — | Existing Postgres. Only the `gw` schema is created. |
+| `SC_APP_CONFIG_URL` | for `/v1` | — | The APP's config endpoint (§2). |
+| `SC_APP_SERVICE_KEY` | strongly recommended | — | Shared secret proving the caller is this service (§0). Unset → a leaked client key alone can pull provider credentials from the APP. |
+| `SC_APP_SERVICE_KEY_HEADER` | no | `X-Service-Key` | Header the service key travels in. Never `Authorization`. |
+| `SC_LLM_BASE_URL` | for `/v1` | — | mlops chat endpoint. |
+| `SC_EMBED_BASE_URL` | for `/v1` | — | mlops embeddings endpoint. |
+| `SC_EXTRACTOR_BASE_URL` | no | — | Only used when the APP returns an extractor model. |
+| `SC_APP_CONFIG_TTL` | no | `60` | Seconds a key's config is cached in memory. |
+| `SC_APP_CONFIG_MAX_ENTRIES` | no | `10000` | Ceiling on that cache (it is keyed by caller key). |
+| `SC_ADMIN_API_KEY` | no | — | Gates SaaS admin routes **and** `/metrics`. Unset → both 503. |
+| `SC_SSO_JWKS_URL` | for RS/ES/PS/Ed JWTs | — | The SSO's JWKS endpoint. |
+| `SC_SSO_SHARED_SECRET` | for HS* JWTs | — | Shared secret, verified with stdlib `hmac`. |
+| `SC_SSO_ALGORITHMS` | no | `["RS256"]` | Allowlist. Naming one you have no key for is a fatal startup error. |
+| `SC_SSO_ISSUER` | no | — | Expected `iss`. Unset → unchecked. |
+| `SC_SSO_AUDIENCE` | no | — | Expected `aud`. **Set it if your SSO serves more than us.** |
+| `SC_SSO_LEEWAY` | no | `60` | Clock-skew tolerance for `exp`/`nbf`, seconds. |
+| `SC_SSO_JWKS_TTL` | no | `300` | Seconds to cache the JWKS. |
+| `SC_MAX_REQUEST_BYTES` | no | `1048576` | Request-body ceiling, enforced on the stream. 0 disables. |
+| `SC_READINESS_TIMEOUT` | no | `2.0` | Per-dependency deadline for `/ready`. |
+| `SC_GATEWAY_UPSTREAM_TIMEOUT` | no | `120` | Timeout for upstream LLM calls. |
+| `SC_LOG_LEVEL` | no | `INFO` | Root log level. |
+| `SC_ENVIRONMENT` | no | `production` | Tag surfaced to logs and Sentry. |
+| `SC_SENTRY_DSN` | no | — | Error reporting. Needs the `[sentry]` extra. |
+| `SC_SENTRY_TRACES_SAMPLE_RATE` | no | `0.0` | Tracing is off by default. |
+| `SC_CACHE_ENABLED` | no | `true` | Operator switch: `false` makes every request a passthrough. Runtime: `POST /admin/cache`. |
+| `SC_GUARD_*` | no | see §4.6 | Operator limits and break-glass only. |
+
+`.env.example` is the annotated version of this table and is the file to copy.
+
+---
+
+## 6. Known gaps — read before you go live
+
+These are real and unfixed. They are recorded here rather than in a ticket
+nobody reads.
+
+* **No retention policy.** `gw.messages` stores every question and answer, and
+  guard rows can retain flagged text. There is no pruning job, deletion
+  workflow, or erasure path. If you serve regulated data, this is your problem
+  before it is ours.
+* **No schema migrations.** The `gw` schema is created at startup by
+  `ensure_schema()`. There is no Alembic, and no migration exists for the
+  historical `project_id` → `scope` rename, so deploying onto a database older
+  than commit `c323a05` fails at boot.
+* **No rate limits or quotas.** Body size is capped; per-tenant request rate,
+  concurrency, token and storage quotas are not implemented.
+* **Redis is the only control plane.** Tenants, keys and cache metadata live
+  only in Redis. Only gateway cache entries are mirrored to Postgres. Run Redis
+  with persistence and a restore drill you have actually performed.
+* **No distributed tracing.** Sentry tracing defaults to `0.0` and `request_id`
+  is not propagated across services.
+* **Startup is synchronous.** Schema creation and the Redis-from-Postgres
+  rebuild both run before the process serves, which limits how fast a replica
+  can join.
+
+Full status, including what was fixed and what was deliberately left, is in
+[GUARD_HANDOFF.md](GUARD_HANDOFF.md) §13.
